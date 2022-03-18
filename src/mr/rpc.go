@@ -38,6 +38,8 @@ type Task struct {
 type EmptyArgs struct {
 }
 
+var emptyArgs = new(EmptyArgs)
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since

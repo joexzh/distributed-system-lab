@@ -34,8 +34,6 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 type mapf func(string, string) []KeyValue
 type reducef func(string, []string) string
 
-var emptyArgs = new(EmptyArgs)
-
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -75,6 +73,8 @@ func Worker(mapf mapf, reducef reducef) {
 			// map
 			files, err := mapTask(task, mapf)
 			if err != nil {
+				fmt.Printf("map task failed, task: %v, %v\n", task, err)
+
 				failedTask := &Task{
 					Files:    nil,
 					TaskType: 0,
@@ -97,6 +97,8 @@ func Worker(mapf mapf, reducef reducef) {
 			// reduce
 			file, err := reduceTask(task, reducef)
 			if err != nil {
+				fmt.Printf("reduce task failed, task: %v, %v\n", task, err)
+
 				failedTask := &Task{
 					Files:    nil,
 					TaskType: 0,
