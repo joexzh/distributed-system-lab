@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
+	"strconv"
 	"time"
 )
 
@@ -71,7 +73,7 @@ func Worker(mapf mapf, reducef reducef) {
 			continue
 		case 1:
 			// map
-			files, err := runMap(task, mapf)
+			files, err := mapTask(task, mapf)
 			if err != nil {
 				failedTask := &Task{
 					Files:    nil,
@@ -93,7 +95,7 @@ func Worker(mapf mapf, reducef reducef) {
 			}
 		case 2:
 			// reduce
-			files, err := runReduce(task, reducef)
+			file, err := reduceTask(task, reducef)
 			if err != nil {
 				failedTask := &Task{
 					Files:    nil,
@@ -108,7 +110,7 @@ func Worker(mapf mapf, reducef reducef) {
 				}
 			}
 			succeedTask := &Task{
-				Files:    files,
+				Files:    []string{file},
 				TaskType: task.TaskType,
 				TaskNum:  task.TaskNum,
 				Err:      nil,
@@ -129,17 +131,17 @@ func fmtIntermediate(mapTaskNum, reduceTaskNum int) string {
 	return fmt.Sprintf("mr-%v-%v", mapTaskNum, reduceTaskNum)
 }
 
-func runMap(task *Task, mapf mapf) ([]string, error) {
+func mapTask(task *Task, mapf mapf) ([]string, error) {
 	var intermediates map[string][]KeyValue
 
 	for _, filename := range task.Files {
 		file, err := os.Open(filename)
 		if err != nil {
-			return nil, errors.New(fmt.Sprintf("cannot open %v, %v", filename, err))
+			return nil, errors.New(fmt.Sprintf("cannot open %v, %v\n", filename, err))
 		}
 		content, err := ioutil.ReadAll(file)
 		if err != nil {
-			return nil, errors.New(fmt.Sprintf("cannot read %v, %v", filename, err))
+			return nil, errors.New(fmt.Sprintf("cannot read %v, %v\n", filename, err))
 		}
 		file.Close()
 		kva := mapf(filename, string(content))
@@ -159,7 +161,7 @@ func runMap(task *Task, mapf mapf) ([]string, error) {
 		err := encode(ofile, kvs)
 		ofile.Close()
 		if err != nil {
-			return nil, errors.New(fmt.Sprintf("cannot encode to file %v, %v", filename, err))
+			return nil, errors.New(fmt.Sprintf("cannot encode to file %v, %v\n", filename, err))
 		}
 
 		files = append(files, filename)
@@ -168,10 +170,52 @@ func runMap(task *Task, mapf mapf) ([]string, error) {
 	return files, nil
 }
 
-func runReduce(task *Task, reducef reducef) ([]string, error) {
-	// todo reduce
+func reduceTask(task *Task, reducef reducef) (string, error) {
+	var kva []KeyValue
 
-	panic("not implement")
+	for _, filename := range task.Files {
+		file, err := os.Open(filename)
+		if err != nil {
+			return "", errors.New(fmt.Sprintf("cannot open file %v, %v\n", filename, err))
+		}
+		kvs, err := decode(file)
+		if err != nil {
+			return "", errors.New(fmt.Sprintf("cannot decode from file %v, %v", filename, err))
+		}
+		kva = append(kva, kvs...)
+	}
+
+	sort.Sort(ByKey(kva))
+	oname := "mr-out-" + strconv.Itoa(task.TaskNum)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		return "", errors.New(fmt.Sprintf("cannot create or truncate file %v, %v", oname, err))
+	}
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-{reduce task number}.
+	//
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+	ofile.Close()
+
+	return oname, nil
 }
 
 func askForTask(args *EmptyArgs, task *Task) error {
