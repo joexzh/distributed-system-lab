@@ -24,6 +24,19 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type Task struct {
+	Files []string
+	// 0: no task or task failed.
+	// 1: map task or map success.
+	// 2: reduce task or reduce success
+	TaskType int
+	TaskNum  int
+	NReduce  int
+	Err      error
+}
+
+type EmptyArgs struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

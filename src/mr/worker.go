@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +20,19 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+type mapf func(string, string) []KeyValue
+type reducef func(string, []string) string
+
+var emptyArgs = new(EmptyArgs)
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,18 +44,183 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf mapf, reducef reducef) {
 
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+	task := new(Task)
+
+	for {
+		err := askForTask(emptyArgs, task)
+		// network error, consider mr job done, stop worker
+		if err != nil {
+			fmt.Printf("askForTask failed, shutdown worker, %v\n", err)
+			return
+		}
+
+		switch task.TaskType {
+		case 0:
+			// no task assign, keep asking
+			time.Sleep(time.Second)
+			continue
+		case 1:
+			// map
+			files, err := runMap(task, mapf)
+			if err != nil {
+				failedTask := &Task{
+					Files:    nil,
+					TaskType: 0,
+					TaskNum:  task.TaskNum,
+					Err:      err,
+				}
+				if err = responseTask(failedTask); err != nil {
+					// response err, consider master unavailable, stop worker
+					fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
+					return
+				}
+			}
+			succeedTask := &Task{Files: files, TaskType: task.TaskType, TaskNum: task.TaskNum, Err: nil}
+			if err = responseTask(succeedTask); err != nil {
+				// response err, consider master unavailable, stop worker
+				fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
+				return
+			}
+		case 2:
+			// reduce
+			files, err := runReduce(task, reducef)
+			if err != nil {
+				failedTask := &Task{
+					Files:    nil,
+					TaskType: 0,
+					TaskNum:  task.TaskNum,
+					Err:      err,
+				}
+				if err = responseTask(failedTask); err != nil {
+					// response err, consider master unavailable, stop worker
+					fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
+					return
+				}
+			}
+			succeedTask := &Task{
+				Files:    files,
+				TaskType: task.TaskType,
+				TaskNum:  task.TaskNum,
+				Err:      nil,
+			}
+			if err = responseTask(succeedTask); err != nil {
+				// response err, consider master unavailable, stop worker
+				fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
+				return
+			}
+
+		default:
+			time.Sleep(time.Second)
+		}
+	}
+}
+
+func fmtIntermediate(mapTaskNum, reduceTaskNum int) string {
+	return fmt.Sprintf("mr-%v-%v", mapTaskNum, reduceTaskNum)
+}
+
+func runMap(task *Task, mapf mapf) ([]string, error) {
+	var intermediates map[string][]KeyValue
+
+	for _, filename := range task.Files {
+		file, err := os.Open(filename)
+		if err != nil {
+			return nil, errors.New(fmt.Sprintf("cannot open %v, %v", filename, err))
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			return nil, errors.New(fmt.Sprintf("cannot read %v, %v", filename, err))
+		}
+		file.Close()
+		kva := mapf(filename, string(content))
+
+		for _, kv := range kva {
+			reduceTaskNum := ihash(kv.Key) % task.NReduce
+			interFileName := fmtIntermediate(task.TaskNum, reduceTaskNum)
+			kvs := intermediates[interFileName]
+			kvs = append(kvs, kv)
+			intermediates[interFileName] = kvs
+		}
+	}
+
+	var files []string
+	for filename, kvs := range intermediates {
+		ofile, _ := os.Create(filename)
+		err := encode(ofile, kvs)
+		ofile.Close()
+		if err != nil {
+			return nil, errors.New(fmt.Sprintf("cannot encode to file %v, %v", filename, err))
+		}
+
+		files = append(files, filename)
+	}
+
+	return files, nil
+}
+
+func runReduce(task *Task, reducef reducef) ([]string, error) {
+	// todo reduce
+
+	panic("not implement")
+}
+
+func askForTask(args *EmptyArgs, task *Task) error {
+	if err := call("Coordinator.AssignTask", args, task); err != nil {
+		fmt.Println(err)
+		return err
+	}
+	return nil
+}
+
+func responseTask(task *Task) error {
+	if err := call("Coordinator.TaskDone", task, &EmptyArgs{}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func call(method string, args interface{}, reply interface{}) error {
+	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	if err != nil {
+		log.Fatal("dialing err:", err)
+	}
+	defer c.Close()
+
+	err = c.Call(method, args, reply)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	return nil
+}
+
+func encode(file io.Writer, kva []KeyValue) error {
+	en := json.NewEncoder(file)
+	err := en.Encode(&kva)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func decode(file io.Reader) ([]KeyValue, error) {
+	var kva []KeyValue
+	de := json.NewDecoder(file)
+	err := de.Decode(&kva)
+	if err != nil {
+		return nil, err
+	}
+	return kva, nil
 }
 
 //
@@ -43,43 +228,43 @@ func Worker(mapf func(string, string) []KeyValue,
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
-}
+// func CallExample() {
+//
+// 	// declare an argument structure.
+// 	args := ExampleArgs{}
+//
+// 	// fill in the argument(s).
+// 	args.X = 99
+//
+// 	// declare a reply structure.
+// 	reply := ExampleReply{}
+//
+// 	// send the RPC request, wait for the reply.
+// 	call("Coordinator.Example", &args, &reply)
+//
+// 	// reply.Y should be 100.
+// 	fmt.Printf("reply.Y %v\n", reply.Y)
+// }
 
 //
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
 //
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
-	if err != nil {
-		log.Fatal("dialing:", err)
-	}
-	defer c.Close()
-
-	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
-}
+// func call(rpcname string, args interface{}, reply interface{}) bool {
+// 	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+// 	// sockname := coordinatorSock()
+// 	// c, err := rpc.DialHTTP("unix", sockname)
+// 	if err != nil {
+// 		log.Fatal("dialing:", err)
+// 	}
+// 	defer c.Close()
+//
+// 	err = c.Call(rpcname, args, reply)
+// 	if err == nil {
+// 		return true
+// 	}
+//
+// 	fmt.Println(err)
+// 	return false
+// }
