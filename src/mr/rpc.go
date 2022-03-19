@@ -24,21 +24,34 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+const (
+	taskTypeJobDone = iota - 1
+	taskTypeEmpty
+	taskTypeMap
+	taskTypeReduce
+)
+
+const (
+	taskStatusIdle = iota
+	taskStatusBusy
+	taskStatusFailed
+	taskStatusComplete
+)
+
 type Task struct {
-	Files []string
-	// 0: no task or task failed.
-	// 1: map task or map success.
-	// 2: reduce task or reduce success
-	TaskType int
-	TaskNum  int
-	NReduce  int
-	Err      error
+	InputFiles  []string
+	OutputFiles map[int]string
+	TaskType    int
+	TaskNum     int
+	Status      int
+	NReduce     int
+	Version     int
 }
 
 type EmptyArgs struct {
 }
 
-var emptyArgs = new(EmptyArgs)
+var emptyArgs = &EmptyArgs{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

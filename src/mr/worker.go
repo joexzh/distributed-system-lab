@@ -51,92 +51,87 @@ func Worker(mapf mapf, reducef reducef) {
 
 	// Your worker implementation here.
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-	task := new(Task)
-
 	for {
+		var task = &Task{}
 		err := askForTask(emptyArgs, task)
 		// network error, consider mr job done, stop worker
 		if err != nil {
-			fmt.Printf("askForTask failed, shutdown worker, %v\n", err)
+			log.Printf("askForTask failed, shutdown worker, %v\n", err)
 			return
 		}
 
 		switch task.TaskType {
-		case 0:
-			// no task assign, keep asking
-			time.Sleep(time.Second)
-			continue
-		case 1:
+		case taskTypeJobDone:
+			// all jobs done, shutdown
+			return
+		case taskTypeEmpty:
+			break
+		case taskTypeMap:
 			// map
-			files, err := mapTask(task, mapf)
-			if err != nil {
-				fmt.Printf("map task failed, task: %v, %v\n", task, err)
+			outputFiles, err := mapTask(task, mapf)
 
-				failedTask := &Task{
-					Files:    nil,
-					TaskType: 0,
-					TaskNum:  task.TaskNum,
-					Err:      err,
-				}
-				if err = responseTask(failedTask); err != nil {
+			// fail
+			if err != nil {
+				log.Printf("map task failed, task: %v, %v\n", task, err)
+				task.Status = taskStatusFailed
+
+				if err = responseTask(task); err != nil {
 					// response err, consider master unavailable, stop worker
-					fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
+					log.Printf("responseTask failed, shutdown worker, %v\n", err)
 					return
 				}
+				break
 			}
-			succeedTask := &Task{Files: files, TaskType: task.TaskType, TaskNum: task.TaskNum, Err: nil}
-			if err = responseTask(succeedTask); err != nil {
+
+			// success
+			task.OutputFiles = outputFiles
+			task.Status = taskStatusComplete
+			if err = responseTask(task); err != nil {
 				// response err, consider master unavailable, stop worker
-				fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
+				log.Printf("responseTask failed, shutdown worker, %v\n", err)
 				return
 			}
-		case 2:
+		case taskTypeReduce:
 			// reduce
 			file, err := reduceTask(task, reducef)
-			if err != nil {
-				fmt.Printf("reduce task failed, task: %v, %v\n", task, err)
 
-				failedTask := &Task{
-					Files:    nil,
-					TaskType: 0,
-					TaskNum:  task.TaskNum,
-					Err:      err,
-				}
-				if err = responseTask(failedTask); err != nil {
+			// fail
+			if err != nil {
+				log.Printf("reduce task failed, task: %v, %v\n", task, err)
+				task.Status = taskStatusFailed
+				if err = responseTask(task); err != nil {
 					// response err, consider master unavailable, stop worker
-					fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
+					log.Printf("responseTask failed, shutdown worker, %v\n", err)
 					return
 				}
-			}
-			succeedTask := &Task{
-				Files:    []string{file},
-				TaskType: task.TaskType,
-				TaskNum:  task.TaskNum,
-				Err:      nil,
-			}
-			if err = responseTask(succeedTask); err != nil {
-				// response err, consider master unavailable, stop worker
-				fmt.Printf("responseTask failed, shutdown worker, %v\n", err)
-				return
+				break
 			}
 
-		default:
-			time.Sleep(time.Second)
+			// success
+			task.OutputFiles = make(map[int]string)
+			task.OutputFiles[task.TaskNum] = file
+			task.Status = taskStatusComplete
+			if err = responseTask(task); err != nil {
+				// response err, consider master unavailable, stop worker
+				log.Printf("responseTask failed, shutdown worker, %v\n", err)
+				return
+			}
 		}
+		time.Sleep(time.Second)
 	}
+	// uncomment to send the Example RPC to the coordinator.
+	// CallExample()
 }
 
 func fmtIntermediate(mapTaskNum, reduceTaskNum int) string {
 	return fmt.Sprintf("mr-%v-%v", mapTaskNum, reduceTaskNum)
 }
 
-func mapTask(task *Task, mapf mapf) ([]string, error) {
-	var intermediates map[string][]KeyValue
+func mapTask(task *Task, mapf mapf) (map[int]string, error) {
+	intermediates := make(map[string][]KeyValue)
+	outputFile := make(map[int]string)
 
-	for _, filename := range task.Files {
+	for _, filename := range task.InputFiles {
 		file, err := os.Open(filename)
 		if err != nil {
 			return nil, errors.New(fmt.Sprintf("cannot open %v, %v\n", filename, err))
@@ -151,13 +146,15 @@ func mapTask(task *Task, mapf mapf) ([]string, error) {
 		for _, kv := range kva {
 			reduceTaskNum := ihash(kv.Key) % task.NReduce
 			interFileName := fmtIntermediate(task.TaskNum, reduceTaskNum)
+			if _, ok := outputFile[reduceTaskNum]; !ok {
+				outputFile[reduceTaskNum] = interFileName
+			}
 			kvs := intermediates[interFileName]
 			kvs = append(kvs, kv)
 			intermediates[interFileName] = kvs
 		}
 	}
 
-	var files []string
 	for filename, kvs := range intermediates {
 		ofile, _ := os.Create(filename)
 		err := encode(ofile, kvs)
@@ -165,17 +162,15 @@ func mapTask(task *Task, mapf mapf) ([]string, error) {
 		if err != nil {
 			return nil, errors.New(fmt.Sprintf("cannot encode to file %v, %v\n", filename, err))
 		}
-
-		files = append(files, filename)
 	}
 
-	return files, nil
+	return outputFile, nil
 }
 
 func reduceTask(task *Task, reducef reducef) (string, error) {
 	var kva []KeyValue
 
-	for _, filename := range task.Files {
+	for _, filename := range task.InputFiles {
 		file, err := os.Open(filename)
 		if err != nil {
 			return "", errors.New(fmt.Sprintf("cannot open file %v, %v\n", filename, err))
@@ -216,13 +211,11 @@ func reduceTask(task *Task, reducef reducef) (string, error) {
 		i = j
 	}
 	ofile.Close()
-
 	return oname, nil
 }
 
 func askForTask(args *EmptyArgs, task *Task) error {
 	if err := call("Coordinator.AssignTask", args, task); err != nil {
-		fmt.Println(err)
 		return err
 	}
 	return nil
@@ -236,7 +229,8 @@ func responseTask(task *Task) error {
 }
 
 func call(method string, args interface{}, reply interface{}) error {
-	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	sockname := coordinatorSock()
+	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing err:", err)
 	}
@@ -244,7 +238,6 @@ func call(method string, args interface{}, reply interface{}) error {
 
 	err = c.Call(method, args, reply)
 	if err != nil {
-		fmt.Println(err)
 		return err
 	}
 	return nil
