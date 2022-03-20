@@ -19,14 +19,13 @@ type taskWrap struct {
 type Coordinator struct {
 	// Your definitions here.
 	mapTasks    map[int]*taskWrap
-	mapWg       sync.WaitGroup
 	mapDone     bool
 	reduceTasks map[int]*taskWrap
-	reduceWg    sync.WaitGroup
 	reduceDone  bool
 	coMu        sync.RWMutex
 	nReduce     int
-	assignTasks []*taskWrap
+	taskQueue   chan *taskWrap
+	doneQueue   chan *taskWrap
 	taskExpire  time.Duration
 }
 
@@ -38,12 +37,13 @@ type Coordinator struct {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
-	// Y our code here.
+	// Your code here.
 	c.nReduce = nReduce
 	c.taskExpire = 10 * time.Second
 	c.mapTasks = make(map[int]*taskWrap)
 	c.reduceTasks = make(map[int]*taskWrap)
-	c.assignTasks = make([]*taskWrap, 0)
+	c.taskQueue = make(chan *taskWrap, nReduce)
+	c.doneQueue = make(chan *taskWrap, nReduce)
 
 	// add map tasks
 	taskWraps := make([]*taskWrap, 0, len(files))
@@ -63,55 +63,77 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		c.mapTasks[i] = taskWrap
 		taskWraps = append(taskWraps, taskWrap)
 	}
-	c.mapWg.Add(len(taskWraps))
-	c.assignTasks = append(c.assignTasks, taskWraps...)
-	c.bgWait()
-
+	go c.sendTasks(taskWraps...)
+	go c.bgDone()
 	c.server()
 	return &c
 }
 
-// bgWait for map done and reduce done
-func (c *Coordinator) bgWait() {
-	go func() {
-		c.mapWg.Wait()
-		c.coMu.Lock()
-		c.mapDone = true
-		// create reduce tasks
-		taskWraps := make([]*taskWrap, 0, c.nReduce)
-		for _, tWrap := range c.mapTasks {
-			tWrap.mu.RLock()
-			for reduceTaskNum, filename := range tWrap.task.OutputFiles {
+func (c *Coordinator) sendTasks(tWraps ...*taskWrap) {
+	for _, tWrap := range tWraps {
+		c.taskQueue <- tWrap
+	}
+}
 
-				tWrap, ok := c.reduceTasks[reduceTaskNum]
-				if !ok {
-					tWrap = &taskWrap{
-						done: make(chan struct{}),
-						task: &Task{
-							InputFiles:  make([]string, 0),
-							Status:      taskStatusIdle,
-							Version:     0,
-							TaskType:    taskTypeReduce,
-							TaskNum:     reduceTaskNum,
-							OutputFiles: make(map[int]string),
-						},
-					}
-					c.reduceTasks[reduceTaskNum] = tWrap
-					taskWraps = append(taskWraps, tWrap)
-				}
-				tWrap.task.InputFiles = append(tWrap.task.InputFiles, filename)
+func (c *Coordinator) sendDone(tWraps ...*taskWrap) {
+	for _, tWrap := range tWraps {
+		c.doneQueue <- tWrap
+	}
+}
+
+// bgDone for map done and reduce done
+func (c *Coordinator) bgDone() {
+	var maps []*taskWrap
+	var reduces []*taskWrap
+	for tWrap := range c.doneQueue {
+		if tWrap.task.TaskType == taskTypeMap {
+			maps = append(maps, tWrap)
+			if len(maps) < len(c.mapTasks) {
+				continue
 			}
-			tWrap.mu.RLock()
-		}
-		c.reduceWg.Add(len(taskWraps))
-		c.assignTasks = append(c.assignTasks, taskWraps...)
-		c.coMu.Unlock()
+			c.coMu.Lock()
+			c.mapDone = true
 
-		c.reduceWg.Wait()
-		c.coMu.Lock()
-		c.reduceDone = true
-		c.coMu.Unlock()
-	}()
+			// create reduce tasks
+			taskWraps := make([]*taskWrap, 0, c.nReduce)
+			for _, tWrap := range c.mapTasks {
+				tWrap.mu.RLock()
+				for reduceTaskNum, filename := range tWrap.task.OutputFiles {
+
+					tWrap, ok := c.reduceTasks[reduceTaskNum]
+					if !ok {
+						tWrap = &taskWrap{
+							done: make(chan struct{}),
+							task: &Task{
+								InputFiles:  make([]string, 0),
+								Status:      taskStatusIdle,
+								Version:     0,
+								TaskType:    taskTypeReduce,
+								TaskNum:     reduceTaskNum,
+								OutputFiles: make(map[int]string),
+							},
+						}
+						c.reduceTasks[reduceTaskNum] = tWrap
+						taskWraps = append(taskWraps, tWrap)
+					}
+					tWrap.task.InputFiles = append(tWrap.task.InputFiles, filename)
+				}
+				tWrap.mu.RLock()
+			}
+			c.coMu.Unlock()
+			go c.sendTasks(taskWraps...)
+
+		} else if tWrap.task.TaskType == taskTypeReduce {
+			reduces = append(reduces, tWrap)
+			if len(reduces) < c.nReduce {
+				continue
+			}
+			c.coMu.Lock()
+			c.reduceDone = true
+			c.coMu.Unlock()
+			return
+		}
+	}
 }
 
 func (c *Coordinator) getTaskWrap(taskType, taskNum int) *taskWrap {
@@ -126,59 +148,53 @@ func (c *Coordinator) getTaskWrap(taskType, taskNum int) *taskWrap {
 // Your code here -- RPC handlers for the worker to call.
 
 func (c *Coordinator) AssignTask(_ *EmptyArgs, resp *Task) error {
-	c.coMu.Lock()
-	defer c.coMu.Unlock()
-
-	if c.reduceDone {
-		resp.TaskType = taskTypeJobDone
-		return nil
-	}
-
-	if len(c.assignTasks) == 0 {
-		// assign no task
-		resp.TaskType = taskTypeEmpty
-		return nil
-	}
-
-	tWrap := c.assignTasks[0]
-	c.assignTasks = c.assignTasks[1:]
-	tWrap.mu.Lock()
-	tWrap.task.Status = taskStatusBusy
-
-	resp.Status = tWrap.task.Status
-	resp.TaskType = tWrap.task.TaskType
-	resp.TaskNum = tWrap.task.TaskNum
-	resp.Version = tWrap.task.Version
-	resp.InputFiles = tWrap.task.InputFiles
-	resp.NReduce = tWrap.task.NReduce
-	tWrap.mu.Unlock()
-
-	// check expire
-	go func(tWrap *taskWrap) {
-		select {
-		case <-time.After(c.taskExpire):
-			// expire
-			tWrap.mu.Lock()
-			if tWrap.task.Status == taskStatusBusy {
-				tWrap.task.Version++
-			}
-			tWrap.task.Status = taskStatusFailed
-			c.coMu.Lock()
-			c.assignTasks = append(c.assignTasks, tWrap)
-			c.coMu.Unlock()
-
-			tWrap.mu.Unlock()
-			return
-		case <-tWrap.done:
-			// done
-			return
+	select {
+	case tWrap, ok := <-c.taskQueue:
+		if !ok {
+			resp.TaskType = taskTypeJobDone
+			break
 		}
-	}(tWrap)
+		tWrap.mu.Lock()
+		tWrap.task.Status = taskStatusBusy
+
+		resp.Status = tWrap.task.Status
+		resp.TaskType = tWrap.task.TaskType
+		resp.TaskNum = tWrap.task.TaskNum
+		resp.Version = tWrap.task.Version
+		resp.InputFiles = tWrap.task.InputFiles
+		resp.NReduce = tWrap.task.NReduce
+		tWrap.mu.Unlock()
+
+		// check expire
+		go func(tWrap *taskWrap) {
+			select {
+			case <-time.After(c.taskExpire):
+				// expire
+				tWrap.mu.Lock()
+				if tWrap.task.Status == taskStatusBusy {
+					tWrap.task.Version++
+				}
+				tWrap.task.Status = taskStatusFailed
+				tWrap.mu.Unlock()
+				go c.sendTasks(tWrap)
+				return
+			case <-tWrap.done:
+				// done
+				return
+			}
+		}(tWrap)
+
+	default:
+		resp.TaskType = taskTypeEmpty
+	}
 	return nil
 }
 
 func (c *Coordinator) TaskDone(req *Task, _ *EmptyArgs) error {
 	tWrap := c.getTaskWrap(req.TaskType, req.TaskNum)
+	if tWrap == nil {
+		return nil
+	}
 	tWrap.mu.Lock()
 	defer tWrap.mu.Unlock()
 
@@ -190,19 +206,13 @@ func (c *Coordinator) TaskDone(req *Task, _ *EmptyArgs) error {
 	tWrap.task.Version++
 	switch req.Status {
 	case taskStatusComplete:
-		if tWrap.task.TaskType == taskTypeMap {
-			c.mapWg.Done()
-		} else if tWrap.task.TaskType == taskTypeReduce {
-			c.reduceWg.Done()
-		}
 		close(tWrap.done)
 		tWrap.task.Status = taskStatusComplete
 		tWrap.task.OutputFiles = req.OutputFiles
+		go c.sendDone(tWrap)
 	case taskStatusFailed:
 		tWrap.task.Status = taskStatusFailed
-		c.coMu.Lock()
-		c.assignTasks = append(c.assignTasks, tWrap)
-		c.coMu.Unlock()
+		go c.sendTasks(tWrap)
 	}
 
 	return nil
@@ -222,17 +232,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 // start a thread that listens for RPCs from worker.go
 //
 func (c *Coordinator) server() {
-	var l net.Listener
-
-	defer func() {
-		if err := recover(); err != nil {
-			if l != nil {
-				l.Close()
-				panic(err)
-			}
-		}
-	}()
-
 	rpc.Register(c)
 	rpc.HandleHTTP()
 	// l, e := net.Listen("tcp", ":1234")
@@ -242,7 +241,11 @@ func (c *Coordinator) server() {
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
-	go http.Serve(l, nil)
+	go func(l net.Listener) {
+		if err := http.Serve(l, nil); err != nil {
+			l.Close()
+		}
+	}(l)
 }
 
 //

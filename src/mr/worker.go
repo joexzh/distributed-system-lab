@@ -156,11 +156,15 @@ func mapTask(task *Task, mapf mapf) (map[int]string, error) {
 	}
 
 	for filename, kvs := range intermediates {
-		ofile, _ := os.Create(filename)
-		err := encode(ofile, kvs)
-		ofile.Close()
+		err := createFile(filename, func(file *os.File) error {
+			err := encode(file, kvs)
+			if err != nil {
+				return errors.New(fmt.Sprintf("cannot encode to file %v, %v\n", filename, err))
+			}
+			return nil
+		})
 		if err != nil {
-			return nil, errors.New(fmt.Sprintf("cannot encode to file %v, %v\n", filename, err))
+			return nil, err
 		}
 	}
 
@@ -183,35 +187,50 @@ func reduceTask(task *Task, reducef reducef) (string, error) {
 	}
 
 	sort.Sort(ByKey(kva))
-	oname := "mr-out-" + strconv.Itoa(task.TaskNum)
-	ofile, err := os.Create(oname)
+	filename := "mr-out-" + strconv.Itoa(task.TaskNum)
+
+	err := createFile(filename, func(file *os.File) error {
+		i := 0
+		for i < len(kva) {
+			j := i + 1
+			for j < len(kva) && kva[j].Key == kva[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, kva[k].Value)
+			}
+			output := reducef(kva[i].Key, values)
+
+			// this is the correct format for each line of Reduce output.
+			_, err := fmt.Fprintf(file, "%v %v\n", kva[i].Key, output)
+			if err != nil {
+				return errors.New(fmt.Sprintf("cannot write file %v", file.Name()))
+			}
+			i = j
+		}
+
+		return nil
+	})
 	if err != nil {
-		return "", errors.New(fmt.Sprintf("cannot create or truncate file %v, %v", oname, err))
+		return "", err
 	}
+	return filename, nil
+}
 
-	//
-	// call Reduce on each distinct key in intermediate[],
-	// and print the result to mr-out-{reduce task number}.
-	//
-	i := 0
-	for i < len(kva) {
-		j := i + 1
-		for j < len(kva) && kva[j].Key == kva[i].Key {
-			j++
-		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, kva[k].Value)
-		}
-		output := reducef(kva[i].Key, values)
-
-		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
-
-		i = j
+func createFile(filename string, f func(file *os.File) error) error {
+	file, err := os.CreateTemp("", filename+".*")
+	if err != nil {
+		return errors.New(fmt.Sprintf("cannot create tmp file %v", filename+".*"))
 	}
-	ofile.Close()
-	return oname, nil
+	defer file.Close()
+	if err = f(file); err != nil {
+		return err
+	}
+	if err = os.Rename(file.Name(), filename); err != nil {
+		return errors.New(fmt.Sprintf("cannot rename file %v, %v", file.Name(), filename))
+	}
+	return nil
 }
 
 func askForTask(args *EmptyArgs, task *Task) error {
@@ -232,7 +251,7 @@ func call(method string, args interface{}, reply interface{}) error {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing err:", err)
+		return err
 	}
 	defer c.Close()
 
