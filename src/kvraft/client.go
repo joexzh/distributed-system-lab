@@ -1,13 +1,19 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"sync/atomic"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	id     int
+	Serial int64
+	leader int
 }
 
 func nrand() int64 {
@@ -21,6 +27,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.id = int(nrand())
 	return ck
 }
 
@@ -37,8 +44,36 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
+	serial := atomic.AddInt64(&ck.Serial, 1)
+	for {
+		args := GetArgs{
+			Key:      key,
+			ClientId: ck.id,
+			Serial:   serial,
+		}
+		reply := GetReply{}
+		ok := ck.sendGet(ck.leader, &args, &reply)
+		if ok {
+			if reply.Err == OK {
+				DPrintf("clerk Get, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
+					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
+				return reply.Value
+			}
+			if reply.Err == ErrNoKey {
+				DPrintf("clerk Get, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
+					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
+				return ""
+			}
+		}
+		DPrintf("clerk Get, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
+			ck.id, serial, reply.Err, ck.leader, key, reply.Value)
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.changeLeader(reply.Leader)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 	return ""
 }
 
@@ -54,11 +89,57 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	serial := atomic.AddInt64(&ck.Serial, 1)
+
+	for {
+		args := PutAppendArgs{
+			Key:      key,
+			Value:    value,
+			Op:       op,
+			ClientId: ck.id,
+			Serial:   serial,
+		}
+		reply := PutAppendReply{}
+		ok := ck.sendPutAppend(ck.leader, &args, &reply)
+		if ok {
+			if reply.Err == OK {
+				DPrintf("clerk PutAppend, op %s, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
+					op, ck.id, serial, reply.Err, ck.leader, key, value)
+				return
+			}
+		}
+		DPrintf("clerk PutAppend, op %s, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
+			op, ck.id, serial, reply.Err, ck.leader, key, value)
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.changeLeader(reply.Leader)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, OpPut)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, OpAppend)
+}
+
+func (ck *Clerk) sendGet(server int, args *GetArgs, reply *GetReply) bool {
+	return ck.servers[server].Call("KVServer.Get", args, reply)
+}
+
+func (ck *Clerk) sendPutAppend(server int, args *PutAppendArgs, reply *PutAppendReply) bool {
+	return ck.servers[server].Call("KVServer.PutAppend", args, reply)
+}
+
+// changeLeader, simply add 1.
+func (ck *Clerk) changeLeader(leader int) {
+	// todo looks like the tester don't support assign leader
+	// if leader < 0 {
+	// 	ck.leader = (ck.leader + 1) % len(ck.servers)
+	// 	return
+	// }
+	// ck.leader = leader
+	ck.leader = (ck.leader + 1) % len(ck.servers)
 }
