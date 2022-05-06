@@ -431,7 +431,7 @@ func (rf *Raft) sendApplyChNotify() {
 		rf.signalMu.Lock()
 		defer rf.signalMu.Unlock()
 
-		if !IsSignalClosed(rf.applyChNotify) {
+		if !rf.killed() {
 			rf.applyChNotify <- struct{}{}
 		}
 	}()
@@ -446,11 +446,11 @@ Loop:
 				break Loop
 			}
 			rf.mu.Lock()
+			DPrintf("me %d ApplyMsg Queue %+v", rf.me, rf.applyMsgQueue)
 			if len(rf.applyMsgQueue) == 0 {
 				rf.mu.Unlock()
 				continue Loop
 			}
-			DPrintf("me %d ApplyMsg Queue %+v", rf.me, rf.applyMsgQueue)
 			list := make([]ApplyMsg, len(rf.applyMsgQueue))
 			copy(list, rf.applyMsgQueue)
 			rf.applyMsgQueue = nil
@@ -476,6 +476,7 @@ func (rf *Raft) appendCommits2Queue(startIndex, endIndex int, from int) {
 
 	DPrintf("me %d start batch sendApplyCh as state %d, leader %d from %d to %d, snapshotIndex %d, snapshotTerm %d, log %+v",
 		rf.me, rf.state, from, startIndex, endIndex, rf.snapshotIndex, rf.snapshotTerm, rf.Log)
+	var appended bool
 	for endIndex >= startIndex {
 		index := startIndex
 		startIndex++
@@ -490,44 +491,12 @@ func (rf *Raft) appendCommits2Queue(startIndex, endIndex int, from int) {
 			CommandValid: true,
 		}
 		rf.applyMsgQueue = append(rf.applyMsgQueue, applyMsg)
+		appended = true
 	}
-
-	rf.sendApplyChNotify()
+	if appended {
+		rf.sendApplyChNotify()
+	}
 }
-
-// func (rf *Raft) sendApplyCh(startIndex, endIndex int, from int) {
-// 	rf.applyChMu.Lock()
-// 	defer rf.applyChMu.Unlock()
-//
-// 	applyMsgs := make([]ApplyMsg, 0, endIndex-startIndex+1)
-// 	rf.mu.RLock()
-// 	DPrintf("me %d start batch sendApplyCh as state %d, leader %d from %d to %d, log %+v", rf.me, rf.state, from, startIndex, endIndex, rf.Log)
-// 	for endIndex >= startIndex {
-// 		index := startIndex
-// 		startIndex++
-//
-// 		pos, ok := rf.positionOf(index)
-// 		if !ok {
-// 			continue
-// 		}
-// 		applyMsg := ApplyMsg{
-// 			Command:      rf.Log[pos].Command,
-// 			CommandIndex: index,
-// 			CommandValid: true,
-// 		}
-// 		applyMsgs = append(applyMsgs, applyMsg)
-// 	}
-// 	rf.mu.RUnlock()
-//
-// 	if len(applyMsgs) == 0 {
-// 		return
-// 	}
-//
-// 	for i := range applyMsgs {
-// 		rf.applyCh <- applyMsgs[i]
-// 		DPrintf("me %d committed command %v, index %d", rf.me, applyMsgs[i].Command, applyMsgs[i].CommandIndex)
-// 	}
-// }
 
 // AppendEntries reply
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -1055,10 +1024,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 //
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 	rf.signalMu.Lock()
 	defer rf.signalMu.Unlock()
+
+	atomic.StoreInt32(&rf.dead, 1)
+	// Your code here, if desired.
 	close(rf.applyChNotify)
 }
 
