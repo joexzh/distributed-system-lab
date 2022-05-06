@@ -2,7 +2,6 @@ package raft
 
 import (
 	"log"
-	"time"
 )
 
 // Debugging
@@ -15,14 +14,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func TimeoutCall(timeout time.Duration, f func(chan<- interface{})) interface{} {
-	done := make(chan interface{}, 1)
-
-	go f(done)
+// IsSignalClosed check a signal-channel is closed, this should use lock before modify the channel
+func IsSignalClosed(c <-chan struct{}) bool {
 	select {
-	case <-time.After(timeout):
-		return nil
-	case val := <-done:
-		return val
+	case <-c:
+		return true
+	default:
+		return false
 	}
 }
