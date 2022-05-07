@@ -56,18 +56,18 @@ func (ck *Clerk) Get(key string) string {
 		ok := ck.sendGet(ck.leader, &args, &reply)
 		if ok {
 			if reply.Err == OK {
-				DPrintf("clerk Get, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
-					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
+				DPrintf("clerk Get, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
+					ck.id, serial, ok, reply.Err, ck.leader, key, reply.Value)
 				return reply.Value
 			}
 			if reply.Err == ErrNoKey {
-				DPrintf("clerk Get, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
-					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
+				DPrintf("clerk Get, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
+					ck.id, serial, ok, reply.Err, ck.leader, key, reply.Value)
 				return ""
 			}
 		}
-		DPrintf("clerk Get, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
-			ck.id, serial, reply.Err, ck.leader, key, reply.Value)
+		DPrintf("clerk Get, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
+			ck.id, serial, ok, reply.Err, ck.leader, key, reply.Value)
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.changeLeader(reply.Leader)
 		}
@@ -103,13 +103,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ok := ck.sendPutAppend(ck.leader, &args, &reply)
 		if ok {
 			if reply.Err == OK {
-				DPrintf("clerk PutAppend, op %s, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
-					op, ck.id, serial, reply.Err, ck.leader, key, value)
+				DPrintf("clerk PutAppend, op %s, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
+					op, ck.id, serial, ok, reply.Err, ck.leader, key, value)
 				return
 			}
 		}
-		DPrintf("clerk PutAppend, op %s, client %d, serial %d, reply.Err %s, leader %d, key %s, value %s",
-			op, ck.id, serial, reply.Err, ck.leader, key, value)
+		DPrintf("clerk PutAppend, op %s, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
+			op, ck.id, serial, ok, reply.Err, ck.leader, key, value)
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.changeLeader(reply.Leader)
 		}

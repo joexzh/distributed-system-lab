@@ -89,11 +89,12 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Persistent state on all servers
-	CurrentTerm   int
-	VoteFor       int // if no vote, set to -1
-	Log           []LogEntry
-	snapshotTerm  int
-	snapshotIndex int
+	CurrentTerm             int
+	VoteFor                 int // if no vote, set to -1
+	Log                     []LogEntry
+	snapshotTerm            int
+	snapshotIndex           int
+	snapshotDataOnlyForLoad []byte
 
 	// Volatile state on all servers
 	commitIndex int
@@ -219,7 +220,7 @@ func (rf *Raft) persistSnapshot(state State, snapshot *Snapshot) {
 func (rf *Raft) readSnapshot(data []byte) *Snapshot {
 	var snapshot Snapshot
 
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) == 0 { // bootstrap without any state?
 		snapshot.LastIncludedIndex = -1
 		snapshot.LastIncludedTerm = -1
 		return &snapshot
@@ -279,14 +280,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		Data:              args.Data,
 	}
 	if args.Done {
-		msg := ApplyMsg{
+		snapshotMsg := ApplyMsg{
 			SnapshotValid: true,
 			SnapshotTerm:  snapshot.LastIncludedTerm,
 			SnapshotIndex: snapshot.LastIncludedIndex,
 			Snapshot:      snapshot.Data,
 		}
-		rf.applyMsgQueue = append(rf.applyMsgQueue, msg)
-		rf.sendApplyChNotify()
+		rf.applyMsgQueue = append(rf.applyMsgQueue, snapshotMsg)
+		go rf.sendApplyChNotify()
 		DPrintf("me %d InstallSnapshot ask server to apply snapshot, old index %d, old term %d, new index %d, new term %d",
 			rf.me, rf.snapshotIndex, rf.snapshotTerm, snapshot.LastIncludedIndex, snapshot.LastIncludedTerm)
 	}
@@ -427,14 +428,12 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) sendApplyChNotify() {
-	go func() {
-		rf.signalMu.Lock()
-		defer rf.signalMu.Unlock()
+	rf.signalMu.Lock()
+	defer rf.signalMu.Unlock()
 
-		if !rf.killed() {
-			rf.applyChNotify <- struct{}{}
-		}
-	}()
+	if !rf.killed() {
+		rf.applyChNotify <- struct{}{}
+	}
 }
 
 func (rf *Raft) sendApplyCh() {
@@ -451,8 +450,7 @@ Loop:
 				rf.mu.Unlock()
 				continue Loop
 			}
-			list := make([]ApplyMsg, len(rf.applyMsgQueue))
-			copy(list, rf.applyMsgQueue)
+			list := rf.applyMsgQueue
 			rf.applyMsgQueue = nil
 			rf.mu.Unlock()
 
@@ -494,7 +492,7 @@ func (rf *Raft) appendCommits2Queue(startIndex, endIndex int, from int) {
 		appended = true
 	}
 	if appended {
-		rf.sendApplyChNotify()
+		go rf.sendApplyChNotify()
 	}
 }
 
@@ -1103,6 +1101,16 @@ func (rf *Raft) resetElectionTimeout() {
 	atomic.StoreInt32(&rf.electionWaitFlag, 1)
 }
 
+func (rf *Raft) LoadSnapshot() Snapshot {
+	data := rf.snapshotDataOnlyForLoad
+	rf.snapshotDataOnlyForLoad = nil
+	return Snapshot{
+		LastIncludedIndex: rf.snapshotIndex,
+		LastIncludedTerm:  rf.snapshotTerm,
+		Data:              data,
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -1135,6 +1143,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	ss := rf.readSnapshot(persister.ReadSnapshot())
 	rf.snapshotIndex = ss.LastIncludedIndex
 	rf.snapshotTerm = ss.LastIncludedTerm
+	rf.snapshotDataOnlyForLoad = ss.Data
 
 	if rf.state == leader {
 		go rf.startAppendEntries()
