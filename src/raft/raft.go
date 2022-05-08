@@ -288,8 +288,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		}
 		rf.applyMsgQueue = append(rf.applyMsgQueue, snapshotMsg)
 		go rf.sendApplyChNotify()
-		DPrintf("me %d InstallSnapshot ask server to apply snapshot, old index %d, old term %d, new index %d, new term %d",
-			rf.me, rf.snapshotIndex, rf.snapshotTerm, snapshot.LastIncludedIndex, snapshot.LastIncludedTerm)
+		// DPrintf("me %d InstallSnapshot ask server to apply snapshot, old index %d, old term %d, new index %d, new term %d",
+		// 	rf.me, rf.snapshotIndex, rf.snapshotTerm, snapshot.LastIncludedIndex, snapshot.LastIncludedTerm)
 	}
 
 	rf.mu.Unlock()
@@ -339,9 +339,9 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 
 	// Your code here (2D).
 	rf.mu.Lock()
-	if rf.commitIndex > lastIncludedIndex || rf.snapshotIndex >= lastIncludedIndex {
-		DPrintf("me %d CondInstallSnapshot refuse, lastIncludedTerm %d, lastIncludedIndex %d, rf.commitIndex %d, rf.snapshotIndex %d",
-			rf.me, lastIncludedTerm, lastIncludedIndex, rf.commitIndex, rf.snapshotIndex)
+	if rf.lastApplied > lastIncludedIndex || rf.snapshotIndex >= lastIncludedIndex {
+		DPrintf("me %d CondInstallSnapshot refuse, lastIncludedTerm %d, lastIncludedIndex %d, rf.lastApplied %d, rf.snapshotIndex %d",
+			rf.me, lastIncludedTerm, lastIncludedIndex, rf.lastApplied, rf.snapshotIndex)
 		rf.mu.Unlock()
 		return false
 	}
@@ -358,8 +358,8 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	}
 	rf.persistSnapshot(state, ss)
 	rf.trimLog(lastIncludedIndex, lastIncludedTerm)
-	DPrintf("me %d CondInstallSnapshot approve, lastIncludedTerm %d, lastIncludedIndex %d, rf.commitIndex %d, rf.snapshotIndex %d, log %+v",
-		rf.me, lastIncludedTerm, lastIncludedIndex, rf.commitIndex, rf.snapshotIndex, rf.Log)
+	DPrintf("me %d CondInstallSnapshot approve, lastIncludedTerm %d, lastIncludedIndex %d, rf.lastApplied %d, rf.snapshotIndex %d, log %+v",
+		rf.me, lastIncludedTerm, lastIncludedIndex, rf.lastApplied, rf.snapshotIndex, rf.Log)
 	rf.mu.Unlock()
 	return true
 }
@@ -437,61 +437,48 @@ func (rf *Raft) sendApplyChNotify() {
 }
 
 func (rf *Raft) sendApplyCh() {
-Loop:
-	for !rf.killed() {
-		select {
-		case _, ok := <-rf.applyChNotify:
-			if !ok {
-				break Loop
-			}
-			rf.mu.Lock()
-			DPrintf("me %d ApplyMsg Queue %+v", rf.me, rf.applyMsgQueue)
-			if len(rf.applyMsgQueue) == 0 {
-				rf.mu.Unlock()
-				continue Loop
-			}
-			list := rf.applyMsgQueue
-			rf.applyMsgQueue = nil
+	// if rf.applyChNotify is closed, this loop breaks
+	for range rf.applyChNotify {
+		rf.mu.Lock()
+		DPrintf("me %d ApplyMsg Queue %+v", rf.me, rf.applyMsgQueue)
+		if len(rf.applyMsgQueue) == 0 {
 			rf.mu.Unlock()
+			continue
+		}
+		list := rf.applyMsgQueue
+		rf.applyMsgQueue = nil
+		rf.mu.Unlock()
 
-			for _, applyMsg := range list {
-				rf.applyCh <- applyMsg
-				if applyMsg.CommandValid {
-					DPrintf("me %d sent commit to applyCh, index %d, command %v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
-				} else {
-					DPrintf("me %d sent snapshot to applyCh, index %d, term %d, len(data) %d", rf.me, applyMsg.CommandIndex, applyMsg.SnapshotTerm, len(applyMsg.Snapshot))
-				}
+		for _, applyMsg := range list {
+			rf.applyCh <- applyMsg
+			if applyMsg.CommandValid {
+				DPrintf("me %d sent commit to applyCh, index %d, command %v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
+			} else {
+				DPrintf("me %d sent snapshot to applyCh, index %d, term %d, len(data) %d", rf.me, applyMsg.CommandIndex, applyMsg.SnapshotTerm, len(applyMsg.Snapshot))
 			}
 		}
 	}
 	close(rf.applyCh)
 }
 
-func (rf *Raft) appendCommits2Queue(startIndex, endIndex int, from int) {
-	if startIndex > endIndex || len(rf.Log) == 0 {
-		return
-	}
+func (rf *Raft) appendApplied2Queue() {
 
-	DPrintf("me %d start batch sendApplyCh as state %d, leader %d from %d to %d, snapshotIndex %d, snapshotTerm %d, log %+v",
-		rf.me, rf.state, from, startIndex, endIndex, rf.snapshotIndex, rf.snapshotTerm, rf.Log)
-	var appended bool
-	for endIndex >= startIndex {
-		index := startIndex
-		startIndex++
-
-		pos, ok := rf.positionOf(index)
+	DPrintf("me %d appendApplied2Queue as state %d, from %d to %d, snapshotIndex %d, snapshotTerm %d, log %+v",
+		rf.me, rf.state, rf.lastApplied+1, rf.commitIndex, rf.snapshotIndex, rf.snapshotTerm, rf.Log)
+	for rf.commitIndex > rf.lastApplied {
+		rf.lastApplied++
+		appliedPos, ok := rf.positionOf(rf.lastApplied)
 		if !ok {
 			continue
 		}
 		applyMsg := ApplyMsg{
-			Command:      rf.Log[pos].Command,
-			CommandIndex: index,
 			CommandValid: true,
+			CommandIndex: rf.lastApplied,
+			Command:      rf.Log[appliedPos].Command,
 		}
 		rf.applyMsgQueue = append(rf.applyMsgQueue, applyMsg)
-		appended = true
 	}
-	if appended {
+	if len(rf.applyMsgQueue) > 0 {
 		go rf.sendApplyChNotify()
 	}
 }
@@ -590,7 +577,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// commit
 		_, lastLogIndex = rf.lastLogTermIndex(len(rf.Log))
-		nextCommit := rf.commitIndex + 1
 		if args.LeaderCommit > rf.commitIndex {
 			if args.LeaderCommit < lastLogIndex {
 				rf.commitIndex = args.LeaderCommit
@@ -598,8 +584,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.commitIndex = lastLogIndex
 			}
 		}
-		if rf.commitIndex >= nextCommit {
-			rf.appendCommits2Queue(nextCommit, rf.commitIndex, args.LeaderId)
+		if rf.commitIndex > rf.lastApplied {
+			rf.appendApplied2Queue()
 		}
 	}
 	if persist {
@@ -618,6 +604,7 @@ func (rf *Raft) appendEntries() {
 	if !isLeader {
 		return
 	}
+	var exit bool
 
 	for node := range rf.peers {
 		if rf.me == node {
@@ -673,6 +660,10 @@ func (rf *Raft) appendEntries() {
 			reply := rf.sendAppendEntriesWithTimeout(node, args)
 
 			rf.mu.Lock()
+			if exit {
+				rf.mu.Unlock()
+				return
+			}
 
 			switch {
 			case reply == nil:
@@ -693,10 +684,10 @@ func (rf *Raft) appendEntries() {
 						n := matchIndices[len(matchIndices)-rf.majority]
 						pos, ok := rf.positionOf(n)
 						if ok && rf.Log[pos].Term == rf.CurrentTerm {
-
-							nextCommit := rf.commitIndex + 1
 							rf.commitIndex = n
-							rf.appendCommits2Queue(nextCommit, rf.commitIndex, rf.me)
+							if rf.commitIndex > rf.lastApplied {
+								rf.appendApplied2Queue()
+							}
 						}
 					}
 				}
@@ -707,6 +698,7 @@ func (rf *Raft) appendEntries() {
 				rf.VoteFor = -1
 				rf.persist()
 				rf.resetElectionTimeout()
+				exit = true
 
 			case reply.Term <= currentTerm:
 				// decrease nextIndex
@@ -896,7 +888,8 @@ func (rf *Raft) sendRequestVoteWithTimeout(server int, args *RequestVoteArgs) *R
 }
 
 func (rf *Raft) requestVote() {
-	voteCount := 1
+	processed, voteCount, exit := 1, 1, false
+
 	rf.mu.Lock()
 	rf.state = candidate
 	rf.CurrentTerm++
@@ -913,60 +906,60 @@ func (rf *Raft) requestVote() {
 	rf.mu.Unlock()
 	rf.resetElectionTimeout()
 
-	replyCh := make(chan *RequestVoteReply, len(rf.peers))
 	for node := range rf.peers {
 		if node == rf.me {
-			replyCh <- nil
 			continue
 		}
 
 		go func(node int) {
 			reply := rf.sendRequestVoteWithTimeout(node, args)
-			replyCh <- reply
-		}(node)
-	}
-
-	node := 0
-	for reply := range replyCh {
-		rf.mu.Lock()
-		switch {
-		case reply == nil:
-		case reply.VoteGranted:
-			voteCount++
-			// todo
-			DPrintf("me %d get voted, voteCount %d", rf.me, voteCount)
-			if voteCount >= rf.majority {
-				rf.becomeLeader()
-				rf.persist()
+			rf.mu.Lock()
+			if exit {
 				rf.mu.Unlock()
 				return
 			}
-		case !reply.VoteGranted:
-			if reply.Term > rf.CurrentTerm {
-				DPrintf("me %d requestVote response higher term %d > %d from %d, return to follower, state=%d", rf.me, reply.Term, rf.CurrentTerm, node, rf.state)
-				rf.CurrentTerm = reply.Term
+			processed++
+
+			switch {
+			case reply == nil:
+			case reply.VoteGranted:
+				voteCount++
+				// todo
+				DPrintf("me %d get voted, voteCount %d", rf.me, voteCount)
+				if voteCount >= rf.majority {
+					rf.becomeLeader()
+					rf.persist()
+					exit = true
+					rf.mu.Unlock()
+					return
+				}
+			case !reply.VoteGranted:
+				if reply.Term > rf.CurrentTerm {
+					DPrintf("me %d requestVote response higher term %d > %d from %d, return to follower, state=%d", rf.me, reply.Term, rf.CurrentTerm, node, rf.state)
+					rf.CurrentTerm = reply.Term
+					rf.convertToFollower()
+					rf.VoteFor = -1
+					rf.persist()
+					exit = true
+					rf.mu.Unlock()
+					rf.resetElectionTimeout()
+					return
+				}
+			}
+
+			if rf.state == candidate && voteCount+(len(rf.peers)-processed) < rf.majority {
+				DPrintf("me %d requestVote not enough votes, return to follower, state=%d", rf.me, rf.state)
 				rf.convertToFollower()
 				rf.VoteFor = -1
 				rf.persist()
+				exit = true
 				rf.mu.Unlock()
-				rf.resetElectionTimeout()
+				// rf.resetElectionTimeout()
 				return
 			}
-		}
-
-		if rf.state == candidate && voteCount+(len(rf.peers)-node-1) < rf.majority {
-			DPrintf("me %d requestVote not enough votes, return to follower, state=%d", rf.me, rf.state)
-			rf.convertToFollower()
-			rf.VoteFor = -1
-			rf.persist()
 
 			rf.mu.Unlock()
-			// rf.resetElectionTimeout()
-			return
-		}
-
-		rf.mu.Unlock()
-		node++
+		}(node)
 	}
 }
 

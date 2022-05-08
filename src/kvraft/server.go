@@ -177,6 +177,7 @@ func (kv *KVServer) killed() bool {
 }
 
 func (kv *KVServer) apply() {
+	// kv.applyCh is closed, this loop breaks
 	for applyMsg := range kv.applyCh {
 		switch {
 		case applyMsg.CommandValid:
@@ -190,38 +191,32 @@ func (kv *KVServer) apply() {
 			kv.mu.Lock()
 			kv.index = applyMsg.CommandIndex
 
-			processReply := ProcessReply{}
+			processReply := ProcessReply{Value: ErrWrongLeader}
 			// DPrintf("KVServer %d before apply, op %s, op.ClientId %d, op.Serial %d, currentSerial %d, command.index %d, op.Key %s, op.Value %s, currentValue %s", kv.me, op.Op, op.ClientId, op.Serial, kv.ClientSerial[op.ClientId], apply.CommandIndex, op.Key, op.Value, kv.Store[op.Key])
-			switch {
-			case op.Op == OpGet:
-				if !requestOk {
-					break
-				}
-				val, ok := kv.Store[op.Key]
-				if !ok {
-					processReply.Err = ErrNoKey
-				}
-				processReply.Value = val
-			case op.Serial > kv.ClientSerial[op.ClientId]:
-				if op.Op == OpPut {
+			if op.Serial > kv.ClientSerial[op.ClientId] {
+				switch {
+				case op.Op == OpGet:
+					if !requestOk {
+						break
+					}
+					val, ok := kv.Store[op.Key]
+					if !ok {
+						processReply.Err = ErrNoKey
+					}
+					processReply.Value = val
+				case op.Op == OpPut:
 					kv.Store[op.Key] = op.Value
-				} else if op.Op == OpAppend {
+				case op.Op == OpAppend:
 					kv.Store[op.Key] = kv.Store[op.Key] + op.Value
 				}
-			}
-			if requestOk {
-				if applyMsg.CommandIndex == requestInfo.Index && op.Serial > kv.ClientSerial[op.ClientId] {
+				if requestOk && applyMsg.CommandIndex == requestInfo.Index {
 					if processReply.Err == "" {
 						processReply.Err = OK
 					}
-				} else {
-					processReply.Err = ErrWrongLeader
 				}
+				kv.ClientSerial[op.ClientId] = op.Serial
 				DPrintf("KVServer %d apply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %v, reply.Err %s",
 					kv.me, op.ClientId, op.Serial, kv.ClientSerial[op.ClientId], requestInfo.Index, applyMsg.CommandIndex, applyMsg.Command, processReply.Err)
-			}
-			if op.Serial > kv.ClientSerial[op.ClientId] {
-				kv.ClientSerial[op.ClientId] = op.Serial
 			}
 
 			// check should snapshot
@@ -244,9 +239,6 @@ func (kv *KVServer) apply() {
 				}
 			}
 			kv.mu.Unlock()
-		default:
-			// channel closed, raft killed
-			return
 		}
 	}
 }
