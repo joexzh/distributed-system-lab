@@ -93,8 +93,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.requestsReplyMap.Store(requestId, requestInfo)
 	DPrintf("KVServer %d Get rf.Start, index %d, args.ClientId %d, args.Serial %d", kv.me, index, args.ClientId, args.Serial)
 
+	timer := time.NewTimer(kv.applyTimeout)
+	defer timer.Stop()
 	select {
-	case <-time.After(kv.applyTimeout):
+	case <-timer.C:
 		reply.Err = ErrWrongLeader
 		voteFor := kv.rf.GetVoteFor()
 		if kv.me != voteFor {
@@ -136,8 +138,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.requestsReplyMap.Store(requestId, requestInfo)
 	DPrintf("KVServer %d PutAppend kv.Start, index %d, args.ClientId %d, args.Serial %d", kv.me, index, args.ClientId, args.Serial)
 
+	timer := time.NewTimer(kv.applyTimeout)
+	defer timer.Stop()
 	select {
-	case <-time.After(kv.applyTimeout):
+	case <-timer.C:
 		reply.Err = ErrWrongLeader
 		voteFor := kv.rf.GetVoteFor()
 		if kv.me != voteFor {

@@ -438,6 +438,7 @@ func (rf *Raft) sendApplyChNotify() {
 
 func (rf *Raft) sendApplyCh() {
 	// if rf.applyChNotify is closed, this loop breaks
+	_cap := 1
 	for range rf.applyChNotify {
 		rf.mu.Lock()
 		DPrintf("me %d ApplyMsg Queue %+v", rf.me, rf.applyMsgQueue)
@@ -446,7 +447,10 @@ func (rf *Raft) sendApplyCh() {
 			continue
 		}
 		list := rf.applyMsgQueue
-		rf.applyMsgQueue = nil
+		if len(list) > _cap {
+			_cap = len(list)
+		}
+		rf.applyMsgQueue = make([]ApplyMsg, 0, _cap)
 		rf.mu.Unlock()
 
 		for _, applyMsg := range list {
@@ -753,6 +757,7 @@ func (rf *Raft) sendAppendEntriesWithTimeout(server int, args *AppendEntriesArgs
 	reply := &AppendEntriesReply{}
 
 	go func() {
+		// todo this will block until rpc call return, lead to goroutine leak, we should use some better lib which supports timeout natively
 		ok := rf.sendAppendEntries(server, args, reply)
 		if !ok {
 			done <- nil
@@ -760,8 +765,10 @@ func (rf *Raft) sendAppendEntriesWithTimeout(server int, args *AppendEntriesArgs
 		}
 		done <- reply
 	}()
+	timer := time.NewTimer(rf.rpcTimeout)
+	defer timer.Stop()
 	select {
-	case <-time.After(rf.rpcTimeout):
+	case <-timer.C:
 		return nil
 	case val := <-done:
 		return val
@@ -872,6 +879,7 @@ func (rf *Raft) sendRequestVoteWithTimeout(server int, args *RequestVoteArgs) *R
 	done := make(chan *RequestVoteReply, 1)
 	reply := &RequestVoteReply{}
 	go func() {
+		// todo this will block until rpc call return, lead to goroutine leak, we should use some better lib which supports timeout natively
 		ok := rf.sendRequestVote(server, args, reply)
 		if !ok {
 			done <- nil
@@ -879,8 +887,10 @@ func (rf *Raft) sendRequestVoteWithTimeout(server int, args *RequestVoteArgs) *R
 		}
 		done <- reply
 	}()
+	timer := time.NewTimer(rf.rpcTimeout)
+	defer timer.Stop()
 	select {
-	case <-time.After(rf.rpcTimeout):
+	case <-timer.C:
 		return nil
 	case val := <-done:
 		return val
@@ -1126,6 +1136,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.Log = []LogEntry{{0, nil}}
 	rf.applyCh = applyCh
 	rf.applyChNotify = make(chan struct{}, 1)
+	rf.applyMsgQueue = make([]ApplyMsg, 0, 1)
 	go rf.sendApplyCh()
 	rf.majority = len(peers)/2 + 1
 	rf.rpcTimeout = time.Second
