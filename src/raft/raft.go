@@ -107,9 +107,7 @@ type Raft struct {
 	// only for flow control
 	state             int
 	applyCh           chan ApplyMsg
-	applyChNotify     chan struct{}
-	signalMu          sync.Mutex
-	applyMsgQueue     []ApplyMsg
+	applyChMu         sync.Mutex
 	majority          int
 	heartbeatInterval time.Duration
 	heartbeatWaitFlag int32
@@ -196,7 +194,6 @@ func (rf *Raft) readPersist(data []byte) {
 			{Term: 0, Command: nil},
 		}
 	}
-	DPrintf("me %d readPersist, CurrentTerm %d, VoteFor %d, log %+v", rf.me, rf.CurrentTerm, rf.VoteFor, rf.Log)
 }
 
 func (rf *Raft) persistSnapshot(state State, snapshot *Snapshot) {
@@ -258,6 +255,7 @@ type InstallSnapshotReply struct {
 // Don't implement offset, send the entire snapshot at once.
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
+
 	reply.Term = rf.CurrentTerm
 
 	if rf.CurrentTerm > args.Term {
@@ -265,7 +263,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.mu.Unlock()
 		return
 	}
-
+	rf.resetElectionTimeout()
 	if args.Term > rf.CurrentTerm || (args.Term == rf.CurrentTerm && rf.state == candidate) {
 		DPrintf("me %d InstallSnapshot receive higher term %d > %d from %d, return to follower, state=%v", rf.me, args.Term, reply.Term, args.LeaderId, rf.state)
 		rf.convertToFollower()
@@ -279,27 +277,33 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		LastIncludedTerm:  args.LastIncludedTerm,
 		Data:              args.Data,
 	}
+	var snapshotMsg ApplyMsg
 	if args.Done {
-		snapshotMsg := ApplyMsg{
+		snapshotMsg = ApplyMsg{
 			SnapshotValid: true,
 			SnapshotTerm:  snapshot.LastIncludedTerm,
 			SnapshotIndex: snapshot.LastIncludedIndex,
 			Snapshot:      snapshot.Data,
 		}
-		rf.applyMsgQueue = append(rf.applyMsgQueue, snapshotMsg)
-		go rf.sendApplyChNotify()
 		// DPrintf("me %d InstallSnapshot ask server to apply snapshot, old index %d, old term %d, new index %d, new term %d",
 		// 	rf.me, rf.snapshotIndex, rf.snapshotTerm, snapshot.LastIncludedIndex, snapshot.LastIncludedTerm)
 	}
-
 	rf.mu.Unlock()
-	rf.resetElectionTimeout()
+
+	if snapshotMsg.SnapshotValid {
+		rf.applyChMu.Lock()
+		defer rf.applyChMu.Unlock()
+		if rf.killed() {
+			return
+		}
+		rf.applyCh <- snapshotMsg
+	}
 }
 
 // installSnapshot for leader request.
 // don't care rpcTimeout since install snapshot can consume time.
 // don't care resend since appendEntries will auto-detect nextIndex[i] is discarded.
-func (rf *Raft) installSnapshot(server int, term int) {
+func (rf *Raft) installSnapshot(server int, term int, exit *bool) {
 	DPrintf("me %d installSnapshot to %d", rf.me, server)
 	snapshot := rf.readSnapshot(rf.persister.ReadSnapshot())
 	args := &InstallSnapshotArgs{
@@ -315,14 +319,20 @@ func (rf *Raft) installSnapshot(server int, term int) {
 	ok := rf.sendInstallSnapshot(server, args, reply)
 	if ok {
 		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if exit == nil || *exit {
+			return
+		}
+
 		if reply.Term > rf.CurrentTerm {
 			rf.CurrentTerm = reply.Term
 			rf.convertToFollower()
 			rf.VoteFor = -1
+			*exit = true
 		} else {
 			rf.nextIndex[server] = rf.snapshotIndex + 1
 		}
-		rf.mu.Unlock()
 	}
 }
 
@@ -339,10 +349,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 
 	// Your code here (2D).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if rf.lastApplied > lastIncludedIndex || rf.snapshotIndex >= lastIncludedIndex {
 		DPrintf("me %d CondInstallSnapshot refuse, lastIncludedTerm %d, lastIncludedIndex %d, rf.lastApplied %d, rf.snapshotIndex %d",
 			rf.me, lastIncludedTerm, lastIncludedIndex, rf.lastApplied, rf.snapshotIndex)
-		rf.mu.Unlock()
 		return false
 	}
 
@@ -360,7 +371,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.trimLog(lastIncludedIndex, lastIncludedTerm)
 	DPrintf("me %d CondInstallSnapshot approve, lastIncludedTerm %d, lastIncludedIndex %d, rf.lastApplied %d, rf.snapshotIndex %d, log %+v",
 		rf.me, lastIncludedTerm, lastIncludedIndex, rf.lastApplied, rf.snapshotIndex, rf.Log)
-	rf.mu.Unlock()
 	return true
 }
 
@@ -371,16 +381,18 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if rf.snapshotIndex >= index {
-		rf.mu.Unlock()
 		return
 	}
 
 	pos, ok := rf.positionOf(index)
 	if !ok {
-		rf.mu.Unlock()
 		return
 	}
+	lastIncludedTerm := rf.Log[pos].Term
+	rf.trimLog(index, lastIncludedTerm)
 	state := State{
 		CurrentTerm: rf.CurrentTerm,
 		VoteFor:     rf.VoteFor,
@@ -388,13 +400,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	ss := &Snapshot{
 		LastIncludedIndex: index,
-		LastIncludedTerm:  rf.Log[pos].Term,
+		LastIncludedTerm:  lastIncludedTerm,
 		Data:              snapshot,
 	}
 	rf.persistSnapshot(state, ss)
-	rf.trimLog(ss.LastIncludedIndex, ss.LastIncludedTerm)
 	DPrintf("me %d Snapshot, snapshotIndex %d, snapshotTerm %d, commitIndex %d, log %+v", rf.me, rf.snapshotIndex, rf.snapshotTerm, rf.commitIndex, rf.Log)
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) trimLog(lastIncludedIndex, lastIncludedTerm int) {
@@ -427,48 +437,15 @@ type AppendEntriesReply struct {
 	Success       bool
 }
 
-func (rf *Raft) sendApplyChNotify() {
-	rf.signalMu.Lock()
-	defer rf.signalMu.Unlock()
-
-	if !rf.killed() {
-		rf.applyChNotify <- struct{}{}
+func (rf *Raft) sendCommit2ApplyCh() {
+	rf.applyChMu.Lock()
+	defer rf.applyChMu.Unlock()
+	if rf.killed() {
+		return
 	}
-}
 
-func (rf *Raft) sendApplyCh() {
-	// if rf.applyChNotify is closed, this loop breaks
-	_cap := 1
-	for range rf.applyChNotify {
-		rf.mu.Lock()
-		DPrintf("me %d ApplyMsg Queue %+v", rf.me, rf.applyMsgQueue)
-		if len(rf.applyMsgQueue) == 0 {
-			rf.mu.Unlock()
-			continue
-		}
-		list := rf.applyMsgQueue
-		if len(list) > _cap {
-			_cap = len(list)
-		}
-		rf.applyMsgQueue = make([]ApplyMsg, 0, _cap)
-		rf.mu.Unlock()
-
-		for _, applyMsg := range list {
-			rf.applyCh <- applyMsg
-			if applyMsg.CommandValid {
-				DPrintf("me %d sent commit to applyCh, index %d, command %v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
-			} else {
-				DPrintf("me %d sent snapshot to applyCh, index %d, term %d, len(data) %d", rf.me, applyMsg.CommandIndex, applyMsg.SnapshotTerm, len(applyMsg.Snapshot))
-			}
-		}
-	}
-	close(rf.applyCh)
-}
-
-func (rf *Raft) appendApplied2Queue() {
-
-	DPrintf("me %d appendApplied2Queue as state %d, from %d to %d, snapshotIndex %d, snapshotTerm %d, log %+v",
-		rf.me, rf.state, rf.lastApplied+1, rf.commitIndex, rf.snapshotIndex, rf.snapshotTerm, rf.Log)
+	rf.mu.Lock()
+	applyMsgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied++
 		appliedPos, ok := rf.positionOf(rf.lastApplied)
@@ -480,16 +457,22 @@ func (rf *Raft) appendApplied2Queue() {
 			CommandIndex: rf.lastApplied,
 			Command:      rf.Log[appliedPos].Command,
 		}
-		rf.applyMsgQueue = append(rf.applyMsgQueue, applyMsg)
+		applyMsgs = append(applyMsgs, applyMsg)
 	}
-	if len(rf.applyMsgQueue) > 0 {
-		go rf.sendApplyChNotify()
+	rf.mu.Unlock()
+
+	if len(applyMsgs) > 0 {
+		for i := range applyMsgs {
+			rf.applyCh <- applyMsgs[i]
+			DPrintf("me %d applied commit applyMsg, index %d, command %v", rf.me, applyMsgs[i].CommandIndex, applyMsgs[i].Command)
+		}
 	}
 }
 
 // AppendEntries reply
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+
 	// DPrintf("me %d AppendEntries receive from %d, currentTerm %d, %+v", rf.me, args.LeaderId, rf.CurrentTerm, *args)
 	reply.Term = rf.CurrentTerm
 
@@ -500,7 +483,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.resetElectionTimeout()
 	persist := false
+	commit := false
 	// switch to follower, continue to check log entries
 	if args.Term > rf.CurrentTerm || rf.state == candidate {
 		DPrintf("me %d AppendEntries receive higher term %d > %d from %d, return to follower, state=%v", rf.me, args.Term, reply.Term, args.LeaderId, rf.state)
@@ -589,14 +574,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		if rf.commitIndex > rf.lastApplied {
-			rf.appendApplied2Queue()
+			commit = true
 		}
 	}
 	if persist {
 		rf.persist()
 	}
 	rf.mu.Unlock()
-	rf.resetElectionTimeout()
+
+	if commit {
+		rf.sendCommit2ApplyCh()
+	}
 }
 
 // appendEntries for leader
@@ -635,7 +623,7 @@ func (rf *Raft) appendEntries() {
 				if rf.nextIndex[node] <= rf.snapshotIndex {
 					// send installSnapshot
 					rf.mu.RUnlock()
-					go rf.installSnapshot(node, currentTerm)
+					rf.installSnapshot(node, currentTerm, &exit)
 					return
 				}
 				prevLogIndex = rf.nextIndex[node] - 1
@@ -664,6 +652,7 @@ func (rf *Raft) appendEntries() {
 			reply := rf.sendAppendEntriesWithTimeout(node, args)
 
 			rf.mu.Lock()
+
 			if exit {
 				rf.mu.Unlock()
 				return
@@ -690,7 +679,9 @@ func (rf *Raft) appendEntries() {
 						if ok && rf.Log[pos].Term == rf.CurrentTerm {
 							rf.commitIndex = n
 							if rf.commitIndex > rf.lastApplied {
-								rf.appendApplied2Queue()
+								rf.mu.Unlock()
+								rf.sendCommit2ApplyCh()
+								return
 							}
 						}
 					}
@@ -800,11 +791,12 @@ type RequestVoteReply struct {
 // RequestVote replay RPC
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	reply.Term = rf.CurrentTerm
 
 	if args.Term < rf.CurrentTerm {
 		reply.VoteGranted = false
-		rf.mu.Unlock()
 		return
 	}
 
@@ -838,7 +830,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if persist {
 		rf.persist()
 	}
-	rf.mu.Unlock()
 }
 
 //
@@ -924,8 +915,9 @@ func (rf *Raft) requestVote() {
 		go func(node int) {
 			reply := rf.sendRequestVoteWithTimeout(node, args)
 			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
 			if exit {
-				rf.mu.Unlock()
 				return
 			}
 			processed++
@@ -940,7 +932,6 @@ func (rf *Raft) requestVote() {
 					rf.becomeLeader()
 					rf.persist()
 					exit = true
-					rf.mu.Unlock()
 					return
 				}
 			case !reply.VoteGranted:
@@ -951,7 +942,6 @@ func (rf *Raft) requestVote() {
 					rf.VoteFor = -1
 					rf.persist()
 					exit = true
-					rf.mu.Unlock()
 					rf.resetElectionTimeout()
 					return
 				}
@@ -963,12 +953,8 @@ func (rf *Raft) requestVote() {
 				rf.VoteFor = -1
 				rf.persist()
 				exit = true
-				rf.mu.Unlock()
 				// rf.resetElectionTimeout()
-				return
 			}
-
-			rf.mu.Unlock()
 		}(node)
 	}
 }
@@ -1025,12 +1011,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 //
 func (rf *Raft) Kill() {
-	rf.signalMu.Lock()
-	defer rf.signalMu.Unlock()
+	rf.applyChMu.Lock()
+	defer rf.applyChMu.Unlock()
 
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	close(rf.applyChNotify)
+	close(rf.applyCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -1135,9 +1121,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.Log = []LogEntry{{0, nil}}
 	rf.applyCh = applyCh
-	rf.applyChNotify = make(chan struct{}, 1)
-	rf.applyMsgQueue = make([]ApplyMsg, 0, 1)
-	go rf.sendApplyCh()
 	rf.majority = len(peers)/2 + 1
 	rf.rpcTimeout = time.Second
 	rf.heartbeatInterval = time.Millisecond * 100
@@ -1155,6 +1138,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-	DPrintf("me %d join, log %+v", me, rf.Log)
+	DPrintf("me %d join, snapshotIndex %d, snapshotTerm %d, log %+v", me, rf.snapshotIndex, rf.snapshotTerm, rf.Log)
 	return rf
 }

@@ -193,6 +193,10 @@ func (kv *KVServer) apply() {
 				requestInfo = requestObj.(RequestInfo)
 			}
 			kv.mu.Lock()
+			// if applyMsg.CommandIndex < kv.index {
+			// 	kv.mu.Unlock()
+			// 	continue
+			// }
 			kv.index = applyMsg.CommandIndex
 
 			processReply := ProcessReply{Value: ErrWrongLeader}
@@ -213,14 +217,14 @@ func (kv *KVServer) apply() {
 				case op.Op == OpAppend:
 					kv.Store[op.Key] = kv.Store[op.Key] + op.Value
 				}
-				if requestOk && applyMsg.CommandIndex == requestInfo.Index {
+				if requestOk {
 					if processReply.Err == "" {
 						processReply.Err = OK
 					}
 				}
-				kv.ClientSerial[op.ClientId] = op.Serial
 				DPrintf("KVServer %d apply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %v, reply.Err %s",
 					kv.me, op.ClientId, op.Serial, kv.ClientSerial[op.ClientId], requestInfo.Index, applyMsg.CommandIndex, applyMsg.Command, processReply.Err)
+				kv.ClientSerial[op.ClientId] = op.Serial
 			}
 
 			// check should snapshot
@@ -279,9 +283,7 @@ func (kv *KVServer) switch2Snapshot(lastIncludedIndex int, data []byte) {
 	kvss := kv.decodeSnapshot(data)
 	kv.Store = kvss.Store
 	kv.ClientSerial = kvss.ClientSerial
-	if lastIncludedIndex > 0 {
-		kv.index = lastIncludedIndex
-	}
+	kv.index = lastIncludedIndex
 }
 
 //
