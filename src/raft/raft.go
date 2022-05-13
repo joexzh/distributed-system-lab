@@ -164,22 +164,9 @@ func (rf *Raft) persist() {
 //
 func (rf *Raft) readPersist(data []byte) {
 
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) == 0 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 
 	b := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(b)
@@ -189,10 +176,8 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&rf.VoteFor) != nil {
 		rf.VoteFor = -1
 	}
-	if d.Decode(&rf.Log) != nil || len(rf.Log) == 0 {
-		rf.Log = []LogEntry{
-			{Term: 0, Command: nil},
-		}
+	if d.Decode(&rf.Log) != nil {
+		rf.Log = nil
 	}
 }
 
@@ -259,7 +244,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.CurrentTerm
 
 	if rf.CurrentTerm > args.Term {
-		DPrintf("me %d InstallSnapshot reject, myTerm %d, args %+v", rf.me, rf.CurrentTerm, *args)
+		DPrintf("me %d InstallSnapshot reject, myTerm %d, args.Term %d, args.LeaderId %d", rf.me, rf.CurrentTerm, args.Term, args.LeaderId)
 		rf.mu.Unlock()
 		return
 	}
@@ -303,7 +288,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 // installSnapshot for leader request.
 // don't care rpcTimeout since install snapshot can consume time.
 // don't care resend since appendEntries will auto-detect nextIndex[i] is discarded.
-func (rf *Raft) installSnapshot(server int, term int, exit *bool) {
+func (rf *Raft) installSnapshot(server int, term int) {
 	DPrintf("me %d installSnapshot to %d", rf.me, server)
 	snapshot := rf.readSnapshot(rf.persister.ReadSnapshot())
 	args := &InstallSnapshotArgs{
@@ -321,16 +306,11 @@ func (rf *Raft) installSnapshot(server int, term int, exit *bool) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 
-		if exit == nil || *exit {
-			return
-		}
-
 		if reply.Term > rf.CurrentTerm {
 			rf.CurrentTerm = reply.Term
 			rf.convertToFollower()
 			rf.VoteFor = -1
-			*exit = true
-		} else {
+		} else if reply.Term == term {
 			rf.nextIndex[server] = rf.snapshotIndex + 1
 		}
 	}
@@ -357,18 +337,19 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 		return false
 	}
 
+	rf.trimLog(lastIncludedIndex, lastIncludedTerm)
 	state := State{
 		CurrentTerm: rf.CurrentTerm,
 		VoteFor:     rf.VoteFor,
 		Log:         rf.Log,
 	}
 	ss := &Snapshot{
-		LastIncludedIndex: lastIncludedTerm,
-		LastIncludedTerm:  lastIncludedIndex,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
 		Data:              snapshot,
 	}
 	rf.persistSnapshot(state, ss)
-	rf.trimLog(lastIncludedIndex, lastIncludedTerm)
+	rf.updateAfterInstalledSnapshot()
 	DPrintf("me %d CondInstallSnapshot approve, lastIncludedTerm %d, lastIncludedIndex %d, rf.lastApplied %d, rf.snapshotIndex %d, log %+v",
 		rf.me, lastIncludedTerm, lastIncludedIndex, rf.lastApplied, rf.snapshotIndex, rf.Log)
 	return true
@@ -419,6 +400,15 @@ func (rf *Raft) trimLog(lastIncludedIndex, lastIncludedTerm int) {
 
 	rf.snapshotTerm = lastIncludedTerm
 	rf.snapshotIndex = lastIncludedIndex
+}
+
+func (rf *Raft) updateAfterInstalledSnapshot() {
+	if rf.commitIndex < rf.snapshotIndex {
+		rf.commitIndex = rf.snapshotIndex
+	}
+	if rf.lastApplied < rf.snapshotIndex {
+		rf.lastApplied = rf.snapshotIndex
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -559,7 +549,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
-		DPrintf("me %d AppendEntries append from leader %d, args.PrevLogIndex %d, args.PrevLogTerm %d, args.Entries %+v", rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+		DPrintf("me %d AppendEntries append from leader %d, args.PrevLogIndex %d, args.PrevLogTerm %d, args.LeaderCommit %d, args.Entries %+v", rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, args.Entries)
 		if len(args.Entries) > 0 {
 			persist = true
 		}
@@ -591,12 +581,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) appendEntries() {
 	rf.mu.RLock()
 	isLeader := rf.state == leader
-	currentTerm := rf.CurrentTerm
+	term := rf.CurrentTerm
 	rf.mu.RUnlock()
 	if !isLeader {
 		return
 	}
-	var exit bool
 
 	for node := range rf.peers {
 		if rf.me == node {
@@ -623,7 +612,7 @@ func (rf *Raft) appendEntries() {
 				if rf.nextIndex[node] <= rf.snapshotIndex {
 					// send installSnapshot
 					rf.mu.RUnlock()
-					rf.installSnapshot(node, currentTerm, &exit)
+					rf.installSnapshot(node, term)
 					return
 				}
 				prevLogIndex = rf.nextIndex[node] - 1
@@ -640,7 +629,7 @@ func (rf *Raft) appendEntries() {
 
 			nextIndex := rf.nextIndex[node]
 			args := &AppendEntriesArgs{
-				Term:         currentTerm,
+				Term:         term,
 				LeaderId:     rf.me,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
@@ -653,7 +642,8 @@ func (rf *Raft) appendEntries() {
 
 			rf.mu.Lock()
 
-			if exit {
+			// when term change, me no longer the leader of old term, ignore reply from old term
+			if term != rf.CurrentTerm {
 				rf.mu.Unlock()
 				return
 			}
@@ -693,9 +683,8 @@ func (rf *Raft) appendEntries() {
 				rf.VoteFor = -1
 				rf.persist()
 				rf.resetElectionTimeout()
-				exit = true
 
-			case reply.Term <= currentTerm:
+			case reply.Term <= term:
 				// decrease nextIndex
 				conflictPos, ok := rf.positionOf(reply.ConflictIndex)
 				if ok {
@@ -894,6 +883,7 @@ func (rf *Raft) requestVote() {
 	rf.mu.Lock()
 	rf.state = candidate
 	rf.CurrentTerm++
+	term := rf.CurrentTerm
 	rf.VoteFor = rf.me
 	lastLogTerm, lastLogIndex := rf.lastLogTermIndex(len(rf.Log))
 	args := &RequestVoteArgs{
@@ -917,7 +907,9 @@ func (rf *Raft) requestVote() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
-			if exit {
+			// when multiple candidates start vote request, me vote for a higher term candidate, me then returns to follower and term increased.
+			// so ignore the all the later vote responses me started this term
+			if exit || rf.CurrentTerm != term {
 				return
 			}
 			processed++
@@ -1119,18 +1111,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.Log = []LogEntry{{0, nil}}
 	rf.applyCh = applyCh
 	rf.majority = len(peers)/2 + 1
 	rf.rpcTimeout = time.Second
 	rf.heartbeatInterval = time.Millisecond * 100
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 	ss := rf.readSnapshot(persister.ReadSnapshot())
 	rf.snapshotIndex = ss.LastIncludedIndex
 	rf.snapshotTerm = ss.LastIncludedTerm
 	rf.snapshotDataOnlyForLoad = ss.Data
+	rf.updateAfterInstalledSnapshot()
+	rf.readPersist(persister.ReadRaftState())
+	if rf.snapshotIndex == -1 && len(rf.Log) == 0 {
+		rf.Log = []LogEntry{{Term: 0, Command: nil}}
+	}
 
 	if rf.state == leader {
 		go rf.startAppendEntries()

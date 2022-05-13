@@ -14,6 +14,8 @@ type Clerk struct {
 	id     int
 	Serial int64
 	leader int
+
+	rpcTimeout time.Duration
 }
 
 func nrand() int64 {
@@ -28,6 +30,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.id = int(nrand())
+	ck.rpcTimeout = 1500 * time.Millisecond
 	return ck
 }
 
@@ -47,31 +50,37 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	serial := atomic.AddInt64(&ck.Serial, 1)
 	for {
+		DPrintf("Clerk start Get: client %d, serial %d, key %s", ck.id, serial, key)
 		args := GetArgs{
 			Key:      key,
 			ClientId: ck.id,
 			Serial:   serial,
 		}
-		reply := GetReply{}
-		ok := ck.sendGet(ck.leader, &args, &reply)
-		if ok {
+		reply := ck.sendGetWithTimeout(ck.leader, &args)
+		if reply != nil {
 			if reply.Err == OK {
-				DPrintf("clerk Get, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
-					ck.id, serial, ok, reply.Err, ck.leader, key, reply.Value)
+				DPrintf("clerk result Get: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
+					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
 				return reply.Value
 			}
 			if reply.Err == ErrNoKey {
-				DPrintf("clerk Get, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
-					ck.id, serial, ok, reply.Err, ck.leader, key, reply.Value)
+				DPrintf("clerk result Get: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
+					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
 				return ""
 			}
+			if reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
+				DPrintf("clerk result Get: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
+					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
+				goto Tail
+			}
 		}
-		DPrintf("clerk Get, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
-			ck.id, serial, ok, reply.Err, ck.leader, key, reply.Value)
-		if !ok || reply.Err == ErrWrongLeader {
-			ck.changeLeader(reply.Leader)
+		DPrintf("clerk result Get: client %d, serial %d, not ok, leader %d, key %s", ck.id, serial, ck.leader, key)
+	Tail:
+		newLeader := -1
+		if reply != nil {
+			newLeader = reply.Leader
 		}
-
+		ck.changeLeader(newLeader)
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -89,8 +98,8 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	serial := atomic.AddInt64(&ck.Serial, 1)
-
 	for {
+		DPrintf("Clerk start %s: client %d, serial %d, key %s, value %s", op, ck.id, serial, key, value)
 		args := PutAppendArgs{
 			Key:      key,
 			Value:    value,
@@ -98,21 +107,27 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ClientId: ck.id,
 			Serial:   serial,
 		}
-		reply := PutAppendReply{}
-		ok := ck.sendPutAppend(ck.leader, &args, &reply)
-		if ok {
+		reply := ck.sendPutAppendWithTimeout(ck.leader, &args)
+		if reply != nil {
 			if reply.Err == OK {
-				DPrintf("clerk PutAppend, op %s, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
-					op, ck.id, serial, ok, reply.Err, ck.leader, key, value)
+				DPrintf("clerk result %s: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
+					op, ck.id, serial, reply.Err, ck.leader, key, value)
 				return
 			}
+			if reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
+				DPrintf("clerk result %s: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
+					op, ck.id, serial, reply.Err, ck.leader, key, value)
+				goto Tail
+			}
 		}
-		DPrintf("clerk PutAppend, op %s, client %d, serial %d, ok %v, reply.Err %s, leader %d, key %s, value %s",
-			op, ck.id, serial, ok, reply.Err, ck.leader, key, value)
-		if !ok || reply.Err == ErrWrongLeader {
-			ck.changeLeader(reply.Leader)
+		DPrintf("clerk result %s: client %d, serial %d, not ok, leader %d, key %s, value %s",
+			op, ck.id, serial, ck.leader, key, value)
+	Tail:
+		newLeader := -1
+		if reply != nil {
+			newLeader = reply.Leader
 		}
-
+		ck.changeLeader(newLeader)
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -124,8 +139,61 @@ func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, OpAppend)
 }
 
+func (ck *Clerk) sendGetWithTimeout(server int, args *GetArgs) *GetReply {
+	// reply := &GetReply{}
+	// ok := ck.sendGet(server, args, reply)
+	// if ok {
+	// 	return reply
+	// }
+	// return nil
+
+	done := make(chan *GetReply, 1)
+
+	go func() {
+		reply := &GetReply{}
+		ok := ck.sendGet(server, args, reply)
+		if !ok {
+			done <- nil
+			return
+		}
+		done <- reply
+	}()
+
+	timer := time.NewTimer(ck.rpcTimeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case reply := <-done:
+		return reply
+	}
+}
+
 func (ck *Clerk) sendGet(server int, args *GetArgs, reply *GetReply) bool {
 	return ck.servers[server].Call("KVServer.Get", args, reply)
+}
+
+func (ck *Clerk) sendPutAppendWithTimeout(server int, args *PutAppendArgs) *PutAppendReply {
+	done := make(chan *PutAppendReply, 1)
+
+	go func() {
+		reply := &PutAppendReply{}
+		ok := ck.sendPutAppend(server, args, reply)
+		if !ok {
+			done <- nil
+			return
+		}
+		done <- reply
+	}()
+
+	timer := time.NewTimer(ck.rpcTimeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case reply := <-done:
+		return reply
+	}
 }
 
 func (ck *Clerk) sendPutAppend(server int, args *PutAppendArgs, reply *PutAppendReply) bool {

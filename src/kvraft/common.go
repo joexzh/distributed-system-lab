@@ -15,6 +15,7 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeout     = "ErrTimeout"
 
 	OpGet    = "Get"
 	OpPut    = "Put"
