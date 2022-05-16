@@ -306,11 +306,15 @@ func (rf *Raft) installSnapshot(server int, term int) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 
+		if term != rf.CurrentTerm {
+			return
+		}
+
 		if reply.Term > rf.CurrentTerm {
 			rf.CurrentTerm = reply.Term
 			rf.convertToFollower()
 			rf.VoteFor = -1
-		} else if reply.Term == term {
+		} else {
 			rf.nextIndex[server] = rf.snapshotIndex + 1
 		}
 	}
