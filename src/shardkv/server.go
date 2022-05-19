@@ -14,24 +14,24 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op       string
-	OpClient *OpStore
+	Op       int
+	OpClient *OpClient
 	OpConfig *OpConfig
 }
 
-type OpStore struct {
-	Key      string
-	Value    string
+type OpClient struct {
 	ClientId int
 	Serial   int64
+	Key      string
+	Value    string
 }
 
 type OpConfig struct {
-	Config       *shardctrler.Config
-	ConfigNum    int               // for UpdateConfig and ShardsDone and UpdateShardStore
-	Shard        int               // for ShardsDone and UpdateShardStore
-	ShardStore   map[string]string // for UpdateShardStore
-	ClientSerial map[int]int64     // for UpdateShardStore
+	ConfigNum    int                 // for ShardsDone and UpdateShardStore
+	Shard        int                 // for ShardsDone and UpdateShardStore
+	Config       *shardctrler.Config // for UpdateConfig
+	ShardStore   map[string]string   // for UpdateShardStore
+	ClientSerial map[int]int64       // for UpdateShardStore
 }
 
 type clientRequestId struct {
@@ -67,11 +67,11 @@ type transferDoneResult struct {
 }
 
 type kvSnapshot struct {
-	ShardStore   map[int]map[string]string
-	ClientSerial map[int]int64
 	Config       shardctrler.Config
 	PrevConfig   shardctrler.Config
+	ClientSerial map[int]int64
 	ShardsDone   map[int]shardDone
+	ShardStore   map[int]map[string]string
 }
 
 const (
@@ -138,7 +138,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	op := Op{
 		Op: OpGet,
-		OpClient: &OpStore{
+		OpClient: &OpClient{
 			ClientId: args.ClientId,
 			Serial:   args.Serial,
 			Key:      args.Key,
@@ -151,14 +151,20 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
 	op := Op{
-		Op: args.Op,
-		OpClient: &OpStore{
+		OpClient: &OpClient{
 			ClientId: args.ClientId,
 			Serial:   args.Serial,
 			Key:      args.Key,
 			Value:    args.Value,
 		},
+	}
+	if args.Op == "Put" {
+		op.Op = OpPut
+	}
+	if args.Op == "Append" {
+		op.Op = OpAppend
 	}
 	generalReply := kv.operate(op)
 	reply.Err = generalReply.Err
@@ -513,9 +519,6 @@ func (kv *ShardKV) checkConfigDone() bool {
 }
 
 func (kv *ShardKV) applyUpdateConfig(op Op) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	if kv.config.Num+1 != op.OpConfig.Config.Num {
 		return
 	}
@@ -541,9 +544,6 @@ func (kv *ShardKV) replyInvalidTransferDoneRequests(index int, currentRid transf
 }
 
 func (kv *ShardKV) applyShardDone(index int, op Op) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	shard := op.OpConfig.Shard
 	rId := transferDoneRequestId{configNum: op.OpConfig.ConfigNum, shard: shard}
 	kv.replyInvalidTransferDoneRequests(index, rId)
@@ -563,7 +563,7 @@ func (kv *ShardKV) applyShardDone(index int, op Op) {
 		}
 	}
 
-	if requestOk {
+	if requestOk && request.replied == false {
 		request.replied = true
 		request.c <- result
 		kv.transferDoneRequests[rId] = request
@@ -571,9 +571,6 @@ func (kv *ShardKV) applyShardDone(index int, op Op) {
 }
 
 func (kv *ShardKV) applyUpdateShardStore(op Op) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	shard := op.OpConfig.Shard
 	if shard >= len(kv.config.Shards) || kv.config.Num != op.OpConfig.ConfigNum || kv.config.Shards[shard] != kv.gid {
 		return
@@ -618,12 +615,9 @@ func (kv *ShardKV) replyInvalidRequests(index int, currentRid clientRequestId) {
 }
 
 func (kv *ShardKV) applyGetPutAppend(index int, op Op) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	rId := clientRequestId{clientId: op.OpClient.ClientId, serial: op.OpClient.Serial}
 	kv.replyInvalidRequests(index, rId)
-	rInfo, requestOk := kv.clientRequests[rId]
+	request, requestOk := kv.clientRequests[rId]
 
 	processReply := processResult{err: OK}
 	rightGroup, sd := kv.validateKey(op.OpClient.Key)
@@ -634,9 +628,9 @@ func (kv *ShardKV) applyGetPutAppend(index int, op Op) {
 			} else {
 				processReply.err = ErrTransferShardUnDone
 			}
-			rInfo.replied = true
-			rInfo.c <- processReply
-			kv.clientRequests[rId] = rInfo
+			request.replied = true
+			request.c <- processReply
+			kv.clientRequests[rId] = request
 		}
 		return
 	}
@@ -659,22 +653,14 @@ func (kv *ShardKV) applyGetPutAppend(index int, op Op) {
 			kv.setShardStoreValue(op.OpClient.Key, value)
 		}
 		DPrintf("ShardKV gid %d, me %d startApply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %+v, reply.err %s",
-			kv.gid, kv.me, op.OpClient.ClientId, op.OpClient.Serial, kv.clientSerial[op.OpClient.ClientId], rInfo.index, index, op, processReply.err)
+			kv.gid, kv.me, op.OpClient.ClientId, op.OpClient.Serial, kv.clientSerial[op.OpClient.ClientId], request.index, index, op, processReply.err)
 		kv.clientSerial[op.OpClient.ClientId] = op.OpClient.Serial
 	}
 
-	// check should snapshot
-	if kv.maxraftstate > -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
-		DPrintf("ShardKV gid %d, me %d startApply command: maxraftstate %d exceeded, call Snapshot(), client %d, serial %d",
-			kv.gid, kv.me, kv.maxraftstate, op.OpClient.ClientId, op.OpClient.Serial)
-		data := kv.encodeSnapshot()
-		kv.rf.Snapshot(kv.index, data)
-	}
-
-	if requestOk {
-		rInfo.replied = true
-		rInfo.c <- processReply
-		kv.clientRequests[rId] = rInfo
+	if requestOk && request.replied == false {
+		request.replied = true
+		request.c <- processReply
+		kv.clientRequests[rId] = request
 	}
 }
 
@@ -682,6 +668,7 @@ func (kv *ShardKV) startApply() {
 	for applyMsg := range kv.applyCh {
 		switch {
 		case applyMsg.CommandValid:
+			kv.mu.Lock()
 			kv.index = applyMsg.CommandIndex
 			op, ok := applyMsg.Command.(Op)
 			if !ok {
@@ -697,6 +684,14 @@ func (kv *ShardKV) startApply() {
 			case OpGet, OpPut, OpAppend:
 				kv.applyGetPutAppend(applyMsg.CommandIndex, op)
 			}
+			// if state size to big, snapshot it
+			if kv.maxraftstate > -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				DPrintf("ShardKV me %d gid %d startApply command: maxraftstate %d exceeded, call Snapshot(), index %d",
+					kv.me, kv.gid, kv.maxraftstate, kv.index)
+				data := kv.encodeSnapshot()
+				kv.rf.Snapshot(kv.index, data)
+			}
+			kv.mu.Unlock()
 		case applyMsg.SnapshotValid:
 			kv.mu.Lock()
 			if applyMsg.SnapshotIndex >= kv.index {

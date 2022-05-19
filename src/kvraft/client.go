@@ -52,7 +52,6 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	serial := atomic.AddInt64(&ck.Serial, 1)
 	for {
-		DPrintf("Clerk start Get: client %d, serial %d, key %s", ck.id, serial, key)
 		args := GetArgs{
 			Key:      key,
 			ClientId: ck.id,
@@ -60,22 +59,27 @@ func (ck *Clerk) Get(key string) string {
 		}
 		for i := 0; i < len(ck.servers); i++ {
 			leader := atomic.LoadInt32(&ck.leader)
+			DPrintf("Clerk start Get: client %d, serial %d, key %s", ck.id, serial, key)
 			reply := ck.sendGetWithTimeout(int(leader), &args)
 			if reply != nil {
 				if reply.Err == OK {
-					DPrintf("clerk result Get: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+					DPrintf("clerk result Get success: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
 						ck.id, serial, reply.Err, leader, key, reply.Value)
 					return reply.Value
 				}
 				if reply.Err == ErrNoKey {
-					DPrintf("clerk result Get: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+					DPrintf("clerk result Get success: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
 						ck.id, serial, reply.Err, leader, key, reply.Value)
 					return ""
 				}
+				DPrintf("clerk result Get fail: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+					ck.id, serial, reply.Err, leader, key, reply.Value)
+			}
+			if reply == nil {
+				DPrintf("clerk result Get fail: client %d, serial %d, NOT OK , leader %d, key %s",
+					ck.id, serial, leader, key)
 			}
 			// wrong leader or not ok
-			DPrintf("clerk result Get: client %d, serial %d, NOT OK or WrongLeader, leader %d, key %s",
-				ck.id, serial, leader, key)
 			newLeader := -1
 			if reply != nil {
 				newLeader = reply.Leader
@@ -100,7 +104,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	serial := atomic.AddInt64(&ck.Serial, 1)
 	for {
-		DPrintf("Clerk start %s: client %d, serial %d, key %s, value %s", op, ck.id, serial, key, value)
+
 		args := PutAppendArgs{
 			Key:      key,
 			Value:    value,
@@ -110,15 +114,22 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		for i := 0; i < len(ck.servers); i++ {
 			leader := atomic.LoadInt32(&ck.leader)
+			DPrintf("Clerk start %s: client %d, serial %d, key %s, value %s", op, ck.id, serial, key, value)
 			reply := ck.sendPutAppendWithTimeout(int(leader), &args)
 			if reply != nil && reply.Err == OK {
-				DPrintf("clerk result %s: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+				if reply.Err == OK {
+					DPrintf("clerk result %s success: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+						op, ck.id, serial, reply.Err, leader, key, value)
+					return
+				}
+				DPrintf("clerk result %s fail: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
 					op, ck.id, serial, reply.Err, leader, key, value)
-				return
 			}
 			// not ok or wrong leader
-			DPrintf("clerk result %s: client %d, serial %d, NOT OK or WrongLeader, leader %d, key %s, value %s",
-				op, ck.id, serial, leader, key, value)
+			if reply == nil {
+				DPrintf("clerk result %s fail: client %d, serial %d, NOT OK, leader %d, key %s, value %s",
+					op, ck.id, serial, leader, key, value)
+			}
 			newLeader := -1
 			if reply != nil {
 				newLeader = reply.Leader

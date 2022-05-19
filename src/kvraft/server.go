@@ -224,7 +224,7 @@ func (kv *KVServer) apply() {
 			rId := requestId{clientId: op.ClientId, serial: op.Serial}
 			kv.replyInvalidRequests(applyMsg.CommandIndex, rId)
 
-			rInfo, requestOk := kv.requests[rId]
+			request, requestOk := kv.requests[rId]
 			processReply := processResult{err: OK}
 			if op.Op == OpGet {
 				if requestOk {
@@ -243,13 +243,13 @@ func (kv *KVServer) apply() {
 					kv.store[op.Key] = kv.store[op.Key] + op.Value
 				}
 				DPrintf("KVServer %d apply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %v, reply.err %s",
-					kv.me, op.ClientId, op.Serial, kv.clientSerial[op.ClientId], rInfo.index, applyMsg.CommandIndex, applyMsg.Command, processReply.err)
+					kv.me, op.ClientId, op.Serial, kv.clientSerial[op.ClientId], request.index, applyMsg.CommandIndex, applyMsg.Command, processReply.err)
 				kv.clientSerial[op.ClientId] = op.Serial
 			}
-			if requestOk {
-				rInfo.replied = true
-				rInfo.c <- processReply
-				kv.requests[rId] = rInfo
+			if requestOk && request.replied == false {
+				request.replied = true
+				request.c <- processReply
+				kv.requests[rId] = request
 			}
 
 			// check should snapshot

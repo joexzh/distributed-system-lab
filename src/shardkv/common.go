@@ -28,12 +28,12 @@ const (
 	ErrDuplicateRequest    = "ErrDuplicateRequest"
 	ErrTransferShardUnDone = "ErrTransferShardUnDone"
 
-	OpGet              = "Get"
-	OpPut              = "Put"
-	OpAppend           = "Append"
-	OpUpdateConfig     = "UpdateConfig"
-	OpShardDone        = "ShardsDone"
-	OpUpdateShardStore = "UpdateShardStore"
+	OpGet              = 1
+	OpPut              = 2
+	OpAppend           = 3
+	OpUpdateConfig     = 4
+	OpShardDone        = 5
+	OpUpdateShardStore = 6
 )
 
 type Err string

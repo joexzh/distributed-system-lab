@@ -280,7 +280,7 @@ func (sc *ShardCtrler) apply() {
 			sc.mu.Lock()
 			rId := requestId{clientId: op.ClientId, serial: op.Serial}
 			sc.replyInvalidRequests(applyMsg.CommandIndex, rId)
-			rInfo, requestOk := sc.requests[rId]
+			reqeust, requestOk := sc.requests[rId]
 			processReply := processResult{err: OK}
 			if op.Op == OpQuery {
 				if requestOk {
@@ -302,10 +302,10 @@ func (sc *ShardCtrler) apply() {
 				}
 				sc.clientSerial[op.ClientId] = op.Serial
 			}
-			if requestOk {
-				rInfo.replied = true
-				rInfo.c <- processReply
-				sc.requests[rId] = rInfo
+			if requestOk && reqeust.replied == false {
+				reqeust.replied = true
+				reqeust.c <- processReply
+				sc.requests[rId] = reqeust
 			}
 			// check should snapshot
 			if sc.maxraftstate > -1 && sc.persister.RaftStateSize() >= sc.maxraftstate {
