@@ -17,7 +17,7 @@ type Clerk struct {
 	// Your data here.
 	id     int
 	serial int64
-	leader int
+	leader int32
 }
 
 func nrand() int64 {
@@ -43,12 +43,14 @@ func (ck *Clerk) Query(num int) Config {
 	args.Num = num
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
+		for range ck.servers {
+			leader := atomic.LoadInt32(&ck.leader)
 			var reply QueryReply
-			ok := srv.Call("ShardCtrler.Query", args, &reply)
+			ok := ck.servers[leader].Call("ShardCtrler.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return reply.Config
 			}
+			ck.changeLeader(leader, -1)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -63,12 +65,14 @@ func (ck *Clerk) Join(servers map[int][]string) {
 
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
+		for range ck.servers {
+			leader := atomic.LoadInt32(&ck.leader)
 			var reply JoinReply
-			ok := srv.Call("ShardCtrler.Join", args, &reply)
+			ok := ck.servers[leader].Call("ShardCtrler.Join", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return
 			}
+			ck.changeLeader(leader, -1)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -83,12 +87,14 @@ func (ck *Clerk) Leave(gids []int) {
 
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
+		for range ck.servers {
+			leader := atomic.LoadInt32(&ck.leader)
 			var reply LeaveReply
-			ok := srv.Call("ShardCtrler.Leave", args, &reply)
+			ok := ck.servers[leader].Call("ShardCtrler.Leave", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return
 			}
+			ck.changeLeader(leader, -1)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -104,18 +110,25 @@ func (ck *Clerk) Move(shard int, gid int) {
 
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
+		for range ck.servers {
+			leader := atomic.LoadInt32(&ck.leader)
 			var reply MoveReply
-			ok := srv.Call("ShardCtrler.Move", args, &reply)
+			ok := ck.servers[leader].Call("ShardCtrler.Move", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return
 			}
+			ck.changeLeader(leader, -1)
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 // changeLeader, simply add 1.
-func (ck *Clerk) changeLeader(leader int) {
-	ck.leader = (ck.leader + 1) % len(ck.servers)
+func (ck *Clerk) changeLeader(oldLeader, newLeader int32) {
+	// todo looks like the tester don't support assign leader
+	// if leader < 0 {
+	// 	ck.leader = (ck.leader + 1) % len(ck.servers)
+	// 	return
+	// }
+	// ck.leader = leader
+	atomic.CompareAndSwapInt32(&ck.leader, oldLeader, (oldLeader+1)%int32(len(ck.servers)))
 }

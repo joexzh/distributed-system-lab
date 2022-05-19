@@ -12,10 +12,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrTimeout     = "ErrTimeout"
+	OK                  = "OK"
+	ErrNoKey            = "ErrNoKey"
+	ErrWrongLeader      = "ErrWrongLeader"
+	ErrDuplicateRequest = "ErrDuplicateRequest"
 
 	OpGet    = "Get"
 	OpPut    = "Put"

@@ -18,7 +18,7 @@ type ShardCtrler struct {
 
 	// Your data here.
 	clientSerial map[int]int64
-	requests     map[RequestId]RequestInfo
+	requests     map[requestId]requestInfo
 	index        int
 	timeout      time.Duration
 	maxraftstate int // snapshot if log grows this big
@@ -27,7 +27,7 @@ type ShardCtrler struct {
 	configs []Config // indexed by config num
 }
 
-type snapshotStruct struct {
+type scSnapshot struct {
 	ClientSerial map[int]int64
 	Configs      []Config
 }
@@ -42,24 +42,21 @@ type Op struct {
 	GID              int              // used for Move: GID
 }
 
-type ProcessResult struct {
-	Config Config
-	Err    Err
+type processResult struct {
+	wrongLeader bool
+	config      Config
+	err         Err
 }
 
-type RequestId struct {
-	ClientId int
-	Serial   int64
+type requestId struct {
+	clientId int
+	serial   int64
 }
 
-type RequestInfo struct {
-	Index int
-	C     chan ProcessResult
-}
-
-type KvSnapshot struct {
-	Store        map[string]string
-	ClientSerial map[int]int64
+type requestInfo struct {
+	replied bool
+	index   int
+	c       chan processResult
 }
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
@@ -137,22 +134,22 @@ func (sc *ShardCtrler) operate(op Op) (generalReply QueryReply) {
 		sc.mu.Unlock()
 		return
 	}
-	command := op
-	index, _, isLeader := sc.rf.Start(command)
-	if !isLeader {
-		sc.mu.Unlock()
-		generalReply.WrongLeader = true
-		return
-	}
-	requestId := RequestId{ClientId: op.ClientId, Serial: op.Serial}
-	_, ok := sc.requests[requestId]
+	rId := requestId{clientId: op.ClientId, serial: op.Serial}
+	_, ok := sc.requests[rId]
 	if ok {
 		sc.mu.Unlock()
 		generalReply.Err = ErrDuplicateRequest
 		return
 	}
-	processCh := make(chan ProcessResult, 1)
-	sc.requests[requestId] = RequestInfo{Index: index, C: processCh}
+	index, _, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		sc.mu.Unlock()
+		generalReply.WrongLeader = true
+		return
+	}
+
+	processCh := make(chan processResult, 1)
+	sc.requests[rId] = requestInfo{index: index, c: processCh}
 	sc.mu.Unlock()
 
 	timer := time.NewTimer(sc.timeout)
@@ -162,9 +159,12 @@ func (sc *ShardCtrler) operate(op Op) (generalReply QueryReply) {
 		generalReply.Err = ErrTimeout
 		generalReply.WrongLeader = true
 	case result := <-processCh:
-		generalReply.Err = result.Err
-		generalReply.Config = result.Config
+		generalReply.Err = result.err
+		generalReply.Config = result.config
 	}
+	sc.mu.Lock()
+	delete(sc.requests, rId)
+	sc.mu.Unlock()
 	return
 }
 
@@ -250,6 +250,22 @@ func (sc *ShardCtrler) processMove(shard, gid int) Err {
 	return OK
 }
 
+// replyInvalidRequests reply wrong leader to previous index requests, except for the one matches applyMsg requestId
+func (sc *ShardCtrler) replyInvalidRequests(index int, currentRid requestId) {
+	invalidRids := make([]requestId, 0)
+	for rId := range sc.requests {
+		if sc.requests[rId].index <= index && rId != currentRid && sc.requests[rId].replied == false {
+			invalidRids = append(invalidRids, rId)
+		}
+	}
+	for i := range invalidRids {
+		rInfo := sc.requests[invalidRids[i]]
+		rInfo.replied = true
+		rInfo.c <- processResult{wrongLeader: true}
+		sc.requests[invalidRids[i]] = rInfo
+	}
+}
+
 func (sc *ShardCtrler) apply() {
 	// kv.applyCh is closed, this loop breaks
 	for applyMsg := range sc.applyCh {
@@ -262,16 +278,17 @@ func (sc *ShardCtrler) apply() {
 				continue
 			}
 			sc.mu.Lock()
-			requestId := RequestId{ClientId: op.ClientId, Serial: op.Serial}
-			requestInfo, requestOk := sc.requests[requestId]
-			processReply := ProcessResult{Err: OK}
+			rId := requestId{clientId: op.ClientId, serial: op.Serial}
+			sc.replyInvalidRequests(applyMsg.CommandIndex, rId)
+			rInfo, requestOk := sc.requests[rId]
+			processReply := processResult{err: OK}
 			if op.Op == OpQuery {
 				if requestOk {
 					c, ok := sc.queryConfig(op.ShardOrConfigNum)
 					if !ok {
-						processReply.Err = ErrConfigNotFound
+						processReply.err = ErrConfigNotFound
 					}
-					processReply.Config = c
+					processReply.config = c
 				}
 			}
 			if op.Serial > sc.clientSerial[op.ClientId] {
@@ -281,21 +298,20 @@ func (sc *ShardCtrler) apply() {
 				case op.Op == OpLeave:
 					sc.processJoinLeave(nil, op.GIDServerMap)
 				case op.Op == OpMove:
-					processReply.Err = sc.processMove(op.ShardOrConfigNum, op.GID)
+					processReply.err = sc.processMove(op.ShardOrConfigNum, op.GID)
 				}
 				sc.clientSerial[op.ClientId] = op.Serial
 			}
-
+			if requestOk {
+				rInfo.replied = true
+				rInfo.c <- processReply
+				sc.requests[rId] = rInfo
+			}
 			// check should snapshot
 			if sc.maxraftstate > -1 && sc.persister.RaftStateSize() >= sc.maxraftstate {
 				DPrintf("ShardCtrler %d apply command: maxraftstate %d exceeded, call Snapshot(), client %d, serial %d", sc.me, sc.maxraftstate, op.ClientId, op.Serial)
 				data := sc.encodeSnapshot()
 				sc.rf.Snapshot(sc.index, data)
-			}
-
-			if requestOk {
-				requestInfo.C <- processReply
-				delete(sc.requests, requestId)
 			}
 			sc.mu.Unlock()
 		case applyMsg.SnapshotValid:
@@ -312,7 +328,7 @@ func (sc *ShardCtrler) apply() {
 }
 
 func (sc *ShardCtrler) encodeSnapshot() []byte {
-	snapshotS := snapshotStruct{
+	snapshotS := scSnapshot{
 		ClientSerial: sc.clientSerial,
 		Configs:      sc.configs,
 	}
@@ -322,8 +338,8 @@ func (sc *ShardCtrler) encodeSnapshot() []byte {
 	return w.Bytes()
 }
 
-func (sc *ShardCtrler) decodeSnapshot(data []byte) snapshotStruct {
-	snapshotS := snapshotStruct{}
+func (sc *ShardCtrler) decodeSnapshot(data []byte) scSnapshot {
+	snapshotS := scSnapshot{}
 	if len(data) == 0 {
 		snapshotS.Configs = make([]Config, 1)
 		snapshotS.Configs[0].Groups = map[int][]string{}
@@ -365,7 +381,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	// Your code here.
 	sc.persister = persister
-	sc.requests = map[RequestId]RequestInfo{}
+	sc.requests = map[requestId]requestInfo{}
 	sc.timeout = time.Second
 	sc.maxraftstate = 10000
 	ss := sc.rf.LoadSnapshot()

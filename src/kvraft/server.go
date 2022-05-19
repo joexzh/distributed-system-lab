@@ -21,28 +21,29 @@ type Op struct {
 	Serial   int64
 }
 
-type ProcessReply struct {
-	Value string
-	Err   Err
+type processResult struct {
+	value string
+	err   Err
 }
 
-type RequestId struct {
-	ClientId int
-	Serial   int64
+type requestId struct {
+	clientId int
+	serial   int64
 }
 
-type RequestInfo struct {
-	Index int
-	C     chan ProcessReply
+type requestInfo struct {
+	replied bool
+	index   int
+	c       chan processResult
 }
 
-type KvSnapshot struct {
+type kvSnapshot struct {
 	Store        map[string]string
 	ClientSerial map[int]int64
 }
 
 type KVServer struct {
-	mu      sync.RWMutex
+	mu      sync.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -54,109 +55,122 @@ type KVServer struct {
 	persister *raft.Persister
 
 	// flow control
-	applyTimeout     time.Duration
-	requestsReplyMap sync.Map
+	applyTimeout time.Duration
+	requests     map[requestId]requestInfo
 
 	index int
 	// fields should be snapshot
-	Store        map[string]string
-	ClientSerial map[int]int64 // key: clientId, value: serial number
+	store        map[string]string
+	clientSerial map[int]int64 // key: clientId, value: serial number
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kv.mu.RLock()
-	if kv.ClientSerial[args.ClientId] >= args.Serial {
-		value, ok := kv.Store[args.Key]
+	reply.Leader = -1
+	kv.mu.Lock()
+	if kv.clientSerial[args.ClientId] >= args.Serial {
+		value, ok := kv.store[args.Key]
 		reply.Value = value
 		reply.Err = OK
 		if !ok {
 			reply.Err = ErrNoKey
 		}
-		DPrintf("KVServer %d Get: serial skip, client %d, args.Serial %d, Serial %d", kv.me, args.ClientId, args.Serial, kv.ClientSerial[args.ClientId])
-		kv.mu.RUnlock()
+		DPrintf("KVServer %d Get: serial skip, client %d, args.serial %d, serial %d", kv.me, args.ClientId, args.Serial, kv.clientSerial[args.ClientId])
+		kv.mu.Unlock()
 		return
 	}
-	kv.mu.RUnlock()
-
+	rId := requestId{clientId: args.ClientId, serial: args.Serial}
+	_, ok := kv.requests[rId]
+	if ok {
+		kv.mu.Unlock()
+		reply.Err = ErrDuplicateRequest
+		DPrintf("KVServer %d me Get: duplicate rId %v", kv.me, rId)
+		return
+	}
 	op := Op{Key: args.Key, Op: OpGet, ClientId: args.ClientId, Serial: args.Serial}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
-		reply.Leader = kv.rf.GetVoteFor()
-		DPrintf("KVServer %d Get: kv.rf.Start(op) wrong leader, newLeader %d, client %d, args.Serial %d", kv.me, reply.Leader, args.ClientId, args.Serial)
+		reply.Leader = kv.rf.GetLeader()
+		DPrintf("KVServer %d Get: kv.rf.Start(op) wrong leader, newLeader %d, client %d, args.serial %d", kv.me, reply.Leader, args.ClientId, args.Serial)
 		return
 	}
-	requestId := RequestId{ClientId: args.ClientId, Serial: args.Serial}
-	processCh := make(chan ProcessReply, 1)
-	requestInfo := RequestInfo{Index: index, C: processCh}
-	kv.requestsReplyMap.Store(requestId, requestInfo)
-	DPrintf("KVServer %d Get accept, index %d, args.Key %s, args.ClientId %d, args.Serial %d", kv.me, index, args.Key, args.ClientId, args.Serial)
+	processCh := make(chan processResult, 1)
+	rInfo := requestInfo{index: index, c: processCh}
+	kv.requests[rId] = rInfo
+	kv.mu.Unlock()
+	DPrintf("KVServer %d Get accept, index %d, args.Key %s, args.clientId %d, args.serial %d", kv.me, index, args.Key, args.ClientId, args.Serial)
 
 	timer := time.NewTimer(kv.applyTimeout)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		reply.Err = ErrTimeout
-		voteFor := kv.rf.GetVoteFor()
-		if kv.me != voteFor {
-			reply.Leader = voteFor
+		reply.Err = ErrWrongLeader
+		leader := kv.rf.GetLeader()
+		if kv.me != leader {
+			reply.Leader = leader
 		}
 	case processReply := <-processCh:
-		reply.Value = processReply.Value
-		reply.Err = processReply.Err
-		if reply.Err == ErrWrongLeader {
-			reply.Leader = kv.rf.GetVoteFor()
-		}
+		reply.Value = processReply.value
+		reply.Err = processReply.err
 	}
-	kv.requestsReplyMap.Delete(requestId)
-	// DPrintf("KVServer %d Get process done, args.Client %d, args.Serial %d, reply.Err %s, reply.Value %s", kv.me, args.ClientId, args.Serial, reply.Err, reply.Value)
+	kv.mu.Lock()
+	delete(kv.requests, rId)
+	kv.mu.Unlock()
+	// DPrintf("KVServer %d Get process done, args.Client %d, args.serial %d, reply.err %s, reply.value %s", kv.me, args.clientId, args.serial, reply.err, reply.value)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.RLock()
-	if kv.ClientSerial[args.ClientId] >= args.Serial {
-		DPrintf("KVServer %d PutAppend: Serial skip, client %d, args.Serial %d, Serial %d", kv.me, args.ClientId, args.Serial, kv.ClientSerial[args.ClientId])
-		kv.mu.RUnlock()
+	reply.Leader = -1
+	kv.mu.Lock()
+	if kv.clientSerial[args.ClientId] >= args.Serial {
+		DPrintf("KVServer %d PutAppend: serial skip, client %d, args.serial %d, serial %d", kv.me, args.ClientId, args.Serial, kv.clientSerial[args.ClientId])
+		kv.mu.Unlock()
 		reply.Err = OK
 		return
 	}
-	kv.mu.RUnlock()
+	rId := requestId{clientId: args.ClientId, serial: args.Serial}
+	_, ok := kv.requests[rId]
+	if ok {
+		kv.mu.Unlock()
+		reply.Err = ErrDuplicateRequest
+		DPrintf("KVServer %d me PutAppend: duplicate rId %v", kv.me, rId)
+		return
+	}
 
 	op := Op{Key: args.Key, Value: args.Value, Op: args.Op, ClientId: args.ClientId, Serial: args.Serial}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
-		reply.Leader = kv.rf.GetVoteFor()
-		DPrintf("KVServer %d PutAppend: kv.rf.Start(op) wrong leader, client %d, args.Serial %d, reply.Leader %d", kv.me, args.ClientId, args.Serial, reply.Leader)
+		reply.Leader = kv.rf.GetLeader()
+		DPrintf("KVServer %d PutAppend: kv.rf.Start(op) wrong leader, client %d, args.serial %d, reply.Leader %d", kv.me, args.ClientId, args.Serial, reply.Leader)
 		return
 	}
-	requestId := RequestId{ClientId: args.ClientId, Serial: args.Serial}
-	processCh := make(chan ProcessReply, 1)
-	requestInfo := RequestInfo{Index: index, C: processCh}
-	kv.requestsReplyMap.Store(requestId, requestInfo)
-	DPrintf("KVServer %d accept %s, index %d, args.Key %s, args.Value %s, args.ClientId %d, args.Serial %d", kv.me, args.Op, index, args.Key, args.Value, args.ClientId, args.Serial)
+
+	processCh := make(chan processResult, 1)
+	rInfo := requestInfo{index: index, c: processCh}
+	kv.requests[rId] = rInfo
+	kv.mu.Unlock()
+	DPrintf("KVServer %d accept %s, index %d, args.Key %s, args.value %s, args.clientId %d, args.serial %d", kv.me, args.Op, index, args.Key, args.Value, args.ClientId, args.Serial)
 
 	timer := time.NewTimer(kv.applyTimeout)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		reply.Err = ErrTimeout
-		voteFor := kv.rf.GetVoteFor()
+		reply.Err = ErrWrongLeader
+		voteFor := kv.rf.GetLeader()
 		if kv.me != voteFor {
 			reply.Leader = voteFor
 		}
 	case processReply := <-processCh:
-		reply.Err = processReply.Err
-		if reply.Err == ErrWrongLeader {
-			reply.Leader = kv.rf.GetVoteFor()
-		}
+		reply.Err = processReply.err
 	}
-	kv.requestsReplyMap.Delete(requestId)
-	// kv.mu.RLock()
-	// DPrintf("KVServer %d PutAppend process done, args %+v, reply %+v", kv.me, args, reply)
-	// kv.mu.RUnlock()
+	kv.mu.Lock()
+	delete(kv.requests, rId)
+	kv.mu.Unlock()
 }
 
 //
@@ -180,46 +194,62 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+// replyInvalidRequests reply wrong leader to previous index requests, except for the one matches applyMsg requestId
+func (kv *KVServer) replyInvalidRequests(index int, currentRid requestId) {
+	invalidRids := make([]requestId, 0)
+	for rId := range kv.requests {
+		if kv.requests[rId].index <= index && rId != currentRid && kv.requests[rId].replied == false {
+			invalidRids = append(invalidRids, rId)
+		}
+	}
+	for i := range invalidRids {
+		rInfo := kv.requests[invalidRids[i]]
+		rInfo.replied = true
+		rInfo.c <- processResult{err: ErrWrongLeader}
+		kv.requests[invalidRids[i]] = rInfo
+	}
+}
+
 func (kv *KVServer) apply() {
 	// kv.applyCh is closed, this loop breaks
 	for applyMsg := range kv.applyCh {
 		switch {
 		case applyMsg.CommandValid:
-			kv.mu.Lock()
-
 			kv.index = applyMsg.CommandIndex
 			op, ok := applyMsg.Command.(Op)
 			if !ok {
-				kv.mu.Unlock()
 				continue
 			}
-			requestId := RequestId{ClientId: op.ClientId, Serial: op.Serial}
-			requestObj, requestOk := kv.requestsReplyMap.Load(requestId)
-			var requestInfo RequestInfo
-			if requestOk {
-				requestInfo = requestObj.(RequestInfo)
-			}
+			kv.mu.Lock()
+			rId := requestId{clientId: op.ClientId, serial: op.Serial}
+			kv.replyInvalidRequests(applyMsg.CommandIndex, rId)
 
-			processReply := ProcessReply{Err: OK}
+			rInfo, requestOk := kv.requests[rId]
+			processReply := processResult{err: OK}
 			if op.Op == OpGet {
 				if requestOk {
-					val, ok := kv.Store[op.Key]
+					val, ok := kv.store[op.Key]
 					if !ok {
-						processReply.Err = ErrNoKey
+						processReply.err = ErrNoKey
 					}
-					processReply.Value = val
+					processReply.value = val
 				}
 			}
-			if op.Serial > kv.ClientSerial[op.ClientId] {
+			if op.Serial > kv.clientSerial[op.ClientId] {
 				switch {
 				case op.Op == OpPut:
-					kv.Store[op.Key] = op.Value
+					kv.store[op.Key] = op.Value
 				case op.Op == OpAppend:
-					kv.Store[op.Key] = kv.Store[op.Key] + op.Value
+					kv.store[op.Key] = kv.store[op.Key] + op.Value
 				}
-				DPrintf("KVServer %d apply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %v, reply.Err %s",
-					kv.me, op.ClientId, op.Serial, kv.ClientSerial[op.ClientId], requestInfo.Index, applyMsg.CommandIndex, applyMsg.Command, processReply.Err)
-				kv.ClientSerial[op.ClientId] = op.Serial
+				DPrintf("KVServer %d apply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %v, reply.err %s",
+					kv.me, op.ClientId, op.Serial, kv.clientSerial[op.ClientId], rInfo.index, applyMsg.CommandIndex, applyMsg.Command, processReply.err)
+				kv.clientSerial[op.ClientId] = op.Serial
+			}
+			if requestOk {
+				rInfo.replied = true
+				rInfo.c <- processReply
+				kv.requests[rId] = rInfo
 			}
 
 			// check should snapshot
@@ -229,10 +259,6 @@ func (kv *KVServer) apply() {
 				kv.rf.Snapshot(kv.index, data)
 			}
 			kv.mu.Unlock()
-
-			if requestOk {
-				requestInfo.C <- processReply
-			}
 		case applyMsg.SnapshotValid:
 			kv.mu.Lock()
 			if applyMsg.SnapshotIndex >= kv.index {
@@ -247,15 +273,18 @@ func (kv *KVServer) apply() {
 }
 
 func (kv *KVServer) encodeSnapshot() []byte {
+	snapshot := kvSnapshot{
+		Store:        kv.store,
+		ClientSerial: kv.clientSerial,
+	}
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(kv.Store)
-	e.Encode(kv.ClientSerial)
+	e.Encode(snapshot)
 	return w.Bytes()
 }
 
-func (kv *KVServer) decodeSnapshot(data []byte) KvSnapshot {
-	snapshot := KvSnapshot{
+func (kv *KVServer) decodeSnapshot(data []byte) kvSnapshot {
+	snapshot := kvSnapshot{
 		Store:        map[string]string{},
 		ClientSerial: map[int]int64{},
 	}
@@ -265,19 +294,17 @@ func (kv *KVServer) decodeSnapshot(data []byte) KvSnapshot {
 
 	b := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(b)
-	if d.Decode(&snapshot.Store) != nil {
-		snapshot.Store = map[string]string{}
+	if err := d.Decode(&snapshot); err != nil {
+		panic(err)
 	}
-	if d.Decode(&snapshot.ClientSerial) != nil {
-		snapshot.ClientSerial = map[int]int64{}
-	}
+
 	return snapshot
 }
 
 func (kv *KVServer) switch2Snapshot(lastIncludedIndex int, data []byte) {
 	kvss := kv.decodeSnapshot(data)
-	kv.Store = kvss.Store
-	kv.ClientSerial = kvss.ClientSerial
+	kv.store = kvss.Store
+	kv.clientSerial = kvss.ClientSerial
 	kv.index = lastIncludedIndex
 }
 
@@ -286,7 +313,7 @@ func (kv *KVServer) switch2Snapshot(lastIncludedIndex int, data []byte) {
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
 // me is the index of the current server in servers[].
-// the k/v server should Store snapshots through the underlying Raft
+// the k/v server should store snapshots through the underlying Raft
 // implementation, which should call persister.SaveStateAndSnapshot() to
 // atomically save the Raft state along with the snapshot.
 // the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
@@ -311,6 +338,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.applyTimeout = time.Second
+	kv.requests = map[requestId]requestInfo{}
 	// restore snapshot
 	ss := kv.rf.LoadSnapshot()
 	kv.switch2Snapshot(ss.LastIncludedIndex, ss.Data)

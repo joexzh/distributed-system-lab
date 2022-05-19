@@ -113,6 +113,7 @@ type Raft struct {
 	heartbeatWaitFlag int32
 	electionWaitFlag  int32
 	rpcTimeout        time.Duration
+	lastAcceptLeader  int // infer state machine the leader
 }
 
 // return currentTerm and whether this server
@@ -129,10 +130,10 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-func (rf *Raft) GetVoteFor() int {
+func (rf *Raft) GetLeader() int {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
-	return rf.VoteFor
+	return rf.lastAcceptLeader
 }
 
 //
@@ -478,6 +479,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.resetElectionTimeout()
+	rf.lastAcceptLeader = args.LeaderId
 	persist := false
 	commit := false
 	// switch to follower, continue to check log entries
@@ -922,8 +924,6 @@ func (rf *Raft) requestVote() {
 			case reply == nil:
 			case reply.VoteGranted:
 				voteCount++
-				// todo
-				DPrintf("me %d get voted, voteCount %d", rf.me, voteCount)
 				if voteCount >= rf.majority {
 					rf.becomeLeader()
 					rf.persist()
@@ -1051,6 +1051,7 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = lastLogIndex + 1
 	}
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.lastAcceptLeader = rf.me
 
 	DPrintf("me %d become a leader, term %d, snapshotIndex %d, snapshotTerm %d, logs %+v", rf.me, rf.CurrentTerm, rf.snapshotIndex, rf.snapshotTerm, rf.Log)
 	go rf.startAppendEntries()
@@ -1130,6 +1131,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	if rf.snapshotIndex == -1 && len(rf.Log) == 0 {
 		rf.Log = []LogEntry{{Term: 0, Command: nil}}
 	}
+	rf.lastAcceptLeader = -1
 
 	if rf.state == leader {
 		go rf.startAppendEntries()

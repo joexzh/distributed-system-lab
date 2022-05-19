@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"6.824/labrpc"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -11,9 +12,10 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu     sync.Mutex
 	id     int
 	Serial int64
-	leader int
+	leader int32
 
 	rpcTimeout time.Duration
 }
@@ -56,31 +58,30 @@ func (ck *Clerk) Get(key string) string {
 			ClientId: ck.id,
 			Serial:   serial,
 		}
-		reply := ck.sendGetWithTimeout(ck.leader, &args)
-		if reply != nil {
-			if reply.Err == OK {
-				DPrintf("clerk result Get: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
-					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
-				return reply.Value
+		for i := 0; i < len(ck.servers); i++ {
+			leader := atomic.LoadInt32(&ck.leader)
+			reply := ck.sendGetWithTimeout(int(leader), &args)
+			if reply != nil {
+				if reply.Err == OK {
+					DPrintf("clerk result Get: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+						ck.id, serial, reply.Err, leader, key, reply.Value)
+					return reply.Value
+				}
+				if reply.Err == ErrNoKey {
+					DPrintf("clerk result Get: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+						ck.id, serial, reply.Err, leader, key, reply.Value)
+					return ""
+				}
 			}
-			if reply.Err == ErrNoKey {
-				DPrintf("clerk result Get: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
-					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
-				return ""
+			// wrong leader or not ok
+			DPrintf("clerk result Get: client %d, serial %d, NOT OK or WrongLeader, leader %d, key %s",
+				ck.id, serial, leader, key)
+			newLeader := -1
+			if reply != nil {
+				newLeader = reply.Leader
 			}
-			if reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
-				DPrintf("clerk result Get: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
-					ck.id, serial, reply.Err, ck.leader, key, reply.Value)
-				goto Tail
-			}
+			ck.changeLeader(leader, int32(newLeader))
 		}
-		DPrintf("clerk result Get: client %d, serial %d, not ok, leader %d, key %s", ck.id, serial, ck.leader, key)
-	Tail:
-		newLeader := -1
-		if reply != nil {
-			newLeader = reply.Leader
-		}
-		ck.changeLeader(newLeader)
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -107,27 +108,23 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ClientId: ck.id,
 			Serial:   serial,
 		}
-		reply := ck.sendPutAppendWithTimeout(ck.leader, &args)
-		if reply != nil {
-			if reply.Err == OK {
-				DPrintf("clerk result %s: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
-					op, ck.id, serial, reply.Err, ck.leader, key, value)
+		for i := 0; i < len(ck.servers); i++ {
+			leader := atomic.LoadInt32(&ck.leader)
+			reply := ck.sendPutAppendWithTimeout(int(leader), &args)
+			if reply != nil && reply.Err == OK {
+				DPrintf("clerk result %s: client %d, serial %d, ok, reply.err %s, leader %d, key %s, value %s",
+					op, ck.id, serial, reply.Err, leader, key, value)
 				return
 			}
-			if reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
-				DPrintf("clerk result %s: client %d, serial %d, ok, reply.Err %s, leader %d, key %s, value %s",
-					op, ck.id, serial, reply.Err, ck.leader, key, value)
-				goto Tail
+			// not ok or wrong leader
+			DPrintf("clerk result %s: client %d, serial %d, NOT OK or WrongLeader, leader %d, key %s, value %s",
+				op, ck.id, serial, leader, key, value)
+			newLeader := -1
+			if reply != nil {
+				newLeader = reply.Leader
 			}
+			ck.changeLeader(leader, int32(newLeader))
 		}
-		DPrintf("clerk result %s: client %d, serial %d, not ok, leader %d, key %s, value %s",
-			op, ck.id, serial, ck.leader, key, value)
-	Tail:
-		newLeader := -1
-		if reply != nil {
-			newLeader = reply.Leader
-		}
-		ck.changeLeader(newLeader)
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -201,12 +198,12 @@ func (ck *Clerk) sendPutAppend(server int, args *PutAppendArgs, reply *PutAppend
 }
 
 // changeLeader, simply add 1.
-func (ck *Clerk) changeLeader(leader int) {
+func (ck *Clerk) changeLeader(oldLeader, newLeader int32) {
 	// todo looks like the tester don't support assign leader
 	// if leader < 0 {
 	// 	ck.leader = (ck.leader + 1) % len(ck.servers)
 	// 	return
 	// }
 	// ck.leader = leader
-	ck.leader = (ck.leader + 1) % len(ck.servers)
+	atomic.CompareAndSwapInt32(&ck.leader, oldLeader, (oldLeader+1)%int32(len(ck.servers)))
 }
