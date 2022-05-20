@@ -65,7 +65,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	// You'll have to add code here.
 	ck.id = int(nrand())
 	ck.config = ck.sm.Query(-1)
-	DPrintf("MakeClerk %d", ck.id)
+	DPrintf("Clerk %d init, config %+v", ck.id, ck.config)
 	return ck
 }
 
@@ -93,21 +93,21 @@ func (ck *Clerk) Get(key string) string {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
-				DPrintf("Clerk start Get: %+v", args)
+				DPrintf("Clerk %d start Get: serial %d, key %s", ck.id, args.Serial, args.Key)
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					DPrintf("Clerk result Get success: id %d, serial %d, err %s, key %s, value %s", ck.id, args.Serial, reply.Err, args.Key, reply.Value)
+					DPrintf("Clerk %d result Get success: serial %d, err %s, key %s, value %s", ck.id, args.Serial, reply.Err, args.Key, reply.Value)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
-					DPrintf("Clerk result Get fail: id %d, serial %d, err %s, key %s, value %s", ck.id, args.Serial, reply.Err, args.Key, reply.Value)
+					DPrintf("Clerk %d result Get fail: serial %d, err %s, key %s, value %s", ck.id, args.Serial, reply.Err, args.Key, reply.Value)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
 				if ok {
-					DPrintf("Clerk result Get fail: id %d, serial %d, err %s, key %s, value %s", ck.id, args.Serial, reply.Err, args.Key, reply.Value)
+					DPrintf("Clerk %d result Get fail: serial %d, err %s, key %s, value %s", ck.id, args.Serial, reply.Err, args.Key, reply.Value)
 				} else {
-					DPrintf("Clerk result Get fail: id %d, serial %d, not ok, key %s, value %s", ck.id, args.Serial, args.Key, reply.Value)
+					DPrintf("Clerk %d result Get fail: serial %d, not ok, key %s, value %s", ck.id, args.Serial, args.Key, reply.Value)
 				}
 			}
 		}
@@ -116,7 +116,10 @@ func (ck *Clerk) Get(key string) string {
 
 		newCfg := ck.sm.Query(-1)
 		ck.mu.Lock()
-		ck.config = newCfg
+		if ck.config.Num < newCfg.Num {
+			ck.config = newCfg
+			DPrintf("Clerk %d change to config %+v", ck.id, newCfg)
+		}
 		ck.mu.Unlock()
 	}
 
@@ -146,21 +149,21 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
-				DPrintf("Clerk start %s: %+v", op, args)
+				DPrintf("Clerk %d start %s: serial %d, key %s, value %s", ck.id, op, args.Serial, args.Key, args.Value)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
-					DPrintf("Clerk result %s success: id %d, serial %d, err %s, key %s, value %s", op, ck.id, args.Serial, reply.Err, args.Key, args.Value)
+					DPrintf("Clerk %d result %s success: serial %d, err %s, key %s, value %s", ck.id, op, args.Serial, reply.Err, args.Key, args.Value)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
-					DPrintf("Clerk result %s fail: id %d, serial %d, err %s, key %s, value %s", op, ck.id, args.Serial, reply.Err, args.Key, args.Value)
+					DPrintf("Clerk %d result %s fail: serial %d, err %s, key %s, value %s", ck.id, op, args.Serial, reply.Err, args.Key, args.Value)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
 				if ok {
-					DPrintf("Clerk result %s fail: id %d, serial %d, err %s, key %s, value %s", op, ck.id, args.Serial, reply.Err, args.Key, args.Value)
+					DPrintf("Clerk %d result %s fail: serial %d, err %s, key %s, value %s", ck.id, op, args.Serial, reply.Err, args.Key, args.Value)
 				} else {
-					DPrintf("Clerk result %s fail: id %d, serial %d, not ok, key %s, value %s", op, ck.id, args.Serial, args.Key, args.Value)
+					DPrintf("Clerk %d result %s fail: serial %d, not ok, key %s, value %s", ck.id, op, args.Serial, args.Key, args.Value)
 				}
 			}
 		}
@@ -168,7 +171,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		// ask controler for the latest configuration.
 		newCfg := ck.sm.Query(-1)
 		ck.mu.Lock()
-		ck.config = newCfg
+		if ck.config.Num < newCfg.Num {
+			ck.config = newCfg
+			DPrintf("Clerk %d change to config %+v", ck.id, newCfg)
+		}
 		ck.mu.Unlock()
 	}
 }

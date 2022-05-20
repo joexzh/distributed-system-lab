@@ -27,8 +27,8 @@ type OpClient struct {
 }
 
 type OpConfig struct {
-	ConfigNum    int                 // for ShardsDone and UpdateShardStore
-	Shard        int                 // for ShardsDone and UpdateShardStore
+	ConfigNum    int                 // for TransferTable and UpdateShardStore
+	Shard        int                 // for TransferTable and UpdateShardStore
 	Config       *shardctrler.Config // for UpdateConfig
 	ShardStore   map[string]string   // for UpdateShardStore
 	ClientSerial map[int]int64       // for UpdateShardStore
@@ -67,20 +67,20 @@ type transferDoneResult struct {
 }
 
 type kvSnapshot struct {
-	Config       shardctrler.Config
-	PrevConfig   shardctrler.Config
-	ClientSerial map[int]int64
-	ShardsDone   map[int]shardDone
-	ShardStore   map[int]map[string]string
+	Config        shardctrler.Config
+	PrevConfig    shardctrler.Config
+	ClientSerial  map[int]int64
+	TransferTable map[int]transferStatus
+	ShardStore    map[int]map[string]string
 }
 
 const (
-	shardDoneTypeSame = iota
-	shardDoneTypeNew
-	shardDoneTypeLose
+	transferStatusSame = 1
+	transferStatusNew  = 2
+	transferStatusLose = 3
 )
 
-type shardDone struct {
+type transferStatus struct {
 	DataDone  bool
 	ReplyDone bool
 	Type      int
@@ -97,22 +97,22 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	persister      *raft.Persister
-	shardReady     map[int]struct{}
-	timeout        time.Duration
-	killCh         chan struct{}
-	clientRequests map[clientRequestId]clientRequestInfo
-	index          int
-	mck            *shardctrler.Clerk
-
+	persister            *raft.Persister
+	timeout              time.Duration
+	killCh               chan struct{}
+	clientRequests       map[clientRequestId]clientRequestInfo
 	transferDoneRequests map[transferDoneRequestId]transferDoneRequest
-	config               shardctrler.Config
-	prevConfig           shardctrler.Config
+	index                int
+	term                 int // detect term change, for sending blank no-op entry
+	mck                  *shardctrler.Clerk
+
 	// persist data
 	shardStore   map[int]map[string]string
 	clientSerial map[int]int64
 	// for config change
-	shardsDone map[int]shardDone
+	transferTable map[int]transferStatus
+	config        shardctrler.Config
+	prevConfig    shardctrler.Config
 }
 
 func (kv *ShardKV) shardStoreValue(key string) (v string, ok bool) {
@@ -172,8 +172,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *ShardKV) operate(op Op) (generalReply GetReply) {
 	kv.mu.Lock()
-	rightGroup, sd := kv.validateKey(op.OpClient.Key)
-	if !rightGroup || !sd {
+	rightGroup, shardDataDone := kv.validateKey(op.OpClient.Key)
+	if !rightGroup || !shardDataDone {
 		kv.mu.Unlock()
 		if !rightGroup {
 			generalReply.Err = ErrWrongGroup
@@ -226,11 +226,11 @@ func (kv *ShardKV) operate(op Op) (generalReply GetReply) {
 	return
 }
 
-func (kv *ShardKV) validateKey(key string) (rightGroup, shardDone bool) {
+func (kv *ShardKV) validateKey(key string) (rightGroup, shardDataDone bool) {
 	shard := key2shard(key)
-	sd, shardDoneOk := kv.shardsDone[shard]
+	status, statusOk := kv.transferTable[shard]
 	rightGroup = kv.config.Shards[shard] == kv.gid
-	shardDone = shardDoneOk && sd.DataDone && (sd.Type == shardDoneTypeNew || sd.Type == shardDoneTypeSame)
+	shardDataDone = statusOk && status.DataDone && (status.Type == transferStatusNew || status.Type == transferStatusSame)
 	return
 }
 
@@ -253,13 +253,14 @@ func (kv *ShardKV) TransferShard(args *TransferShardArgs, reply *TransferShardRe
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	DPrintf("ShardKV me %d gid %d receive TransferShard, meConfigNum %d, meShardStore %+v, meShardDone %+v, args %+v",
-		kv.me, kv.gid, kv.config.Num, kv.shardStore, kv.shardsDone, args)
+	DPrintf("ShardKV me %d gid %d receive TransferShard, meConfigNum %d, meShardStore %+v, meTransferTable %+v, args %+v",
+		kv.me, kv.gid, kv.config.Num, kv.shardStore, kv.transferTable, args)
 	reply.Success = false
 	if kv.gid != args.GID || kv.config.Num != args.ConfigNum {
 		return
 	}
-	if sd, ok := kv.shardsDone[args.Shard]; !ok || (ok && sd.ReplyDone) {
+	status, statusOk := kv.transferTable[args.Shard]
+	if !statusOk || status.Type != transferStatusLose {
 		return
 	}
 
@@ -295,12 +296,12 @@ func (kv *ShardKV) TransferShardDone(args *TransferShardDoneArgs, reply *Transfe
 		kv.mu.Unlock()
 		return
 	}
-	sd, shardDoneOk := kv.shardsDone[args.Shard]
-	if !shardDoneOk || sd.Type != shardDoneTypeLose {
+	status, statusOk := kv.transferTable[args.Shard]
+	if kv.config.Num == args.ConfigNum && (!statusOk || status.Type != transferStatusLose) {
 		kv.mu.Unlock()
 		return
 	}
-	if (kv.config.Num == args.ConfigNum && sd.ReplyDone) || kv.config.Num > args.ConfigNum {
+	if (kv.config.Num == args.ConfigNum && status.ReplyDone) || kv.config.Num > args.ConfigNum {
 		kv.mu.Unlock()
 		reply.Success = true
 		return
@@ -318,8 +319,8 @@ func (kv *ShardKV) TransferShardDone(args *TransferShardDoneArgs, reply *Transfe
 		reply.WrongLeader = true
 		return
 	}
-	result := make(chan transferDoneResult, 1)
-	kv.transferDoneRequests[requestId] = transferDoneRequest{index: index, c: result}
+	resultCh := make(chan transferDoneResult, 1)
+	kv.transferDoneRequests[requestId] = transferDoneRequest{index: index, c: resultCh}
 	kv.mu.Unlock()
 
 	timer := time.NewTimer(kv.timeout)
@@ -327,7 +328,7 @@ func (kv *ShardKV) TransferShardDone(args *TransferShardDoneArgs, reply *Transfe
 	select {
 	case <-timer.C:
 		reply.WrongLeader = true
-	case ret := <-result:
+	case ret := <-resultCh:
 		reply.WrongLeader = ret.wrongLeader
 		reply.Success = ret.success
 	}
@@ -337,17 +338,30 @@ func (kv *ShardKV) TransferShardDone(args *TransferShardDoneArgs, reply *Transfe
 }
 
 func (kv *ShardKV) queryConfig() {
-	_, isLeader := kv.rf.GetState()
+	term, isLeader := kv.rf.GetState()
 	if !isLeader {
 		return
 	}
+	if term > kv.term {
+		// if detected new term, add a blank no-op log entry to make sure raft can move forward
+		kv.term = term
+		kv.rf.Start(Op{Op: NoOp})
+	}
 	kv.mu.RLock()
-	if !kv.checkConfigDone() {
-		transferShardArgsList, transferDoneArgsList := kv.args4Rpc()
+	newDone, loseDone := kv.checkConfigDone()
+	if !newDone || !loseDone {
+		DPrintf("ShardKV me %d gid %d checkConfigDone() false, configNum %d, transferTable %+v", kv.me, kv.gid, kv.config.Num, kv.transferTable)
+		if !newDone {
+			transferShardArgsList, transferDoneArgsList := kv.args4Rpc()
+			prevConfig := kv.prevConfig
+			kv.mu.RUnlock()
+			kv.sendRPCs(transferShardArgsList, transferDoneArgsList, &prevConfig)
+			return
+		}
 		kv.mu.RUnlock()
-		kv.sendRPCs(transferShardArgsList, transferDoneArgsList)
 		return
 	}
+	DPrintf("ShardKV me %d gid %d checkConfigDone() true, configNum %d", kv.me, kv.gid, kv.config.Num)
 	nextNum := kv.config.Num + 1
 	kv.mu.RUnlock()
 
@@ -370,6 +384,7 @@ func (kv *ShardKV) startPollConfig() {
 	for {
 		select {
 		case <-kv.killCh:
+			DPrintf("ShardKV me %d gid %d exit StartPollConfig", kv.me, kv.gid)
 			return
 		case <-time.After(100 * time.Millisecond):
 			kv.queryConfig()
@@ -377,12 +392,29 @@ func (kv *ShardKV) startPollConfig() {
 	}
 }
 
+func (kv *ShardKV) checkConfigDone() (newDone, loseDone bool) {
+	newDone, loseDone = true, true
+	if kv.config.Num < 2 || len(kv.transferTable) == 0 {
+		return true, true
+	}
+	for shard := range kv.transferTable {
+		if kv.transferTable[shard].Type == transferStatusNew && (!kv.transferTable[shard].DataDone || !kv.transferTable[shard].ReplyDone) {
+			newDone = false
+			continue
+		}
+		if kv.transferTable[shard].Type == transferStatusLose && !kv.transferTable[shard].ReplyDone {
+			loseDone = false
+		}
+	}
+	return
+}
+
 func (kv *ShardKV) args4Rpc() ([]TransferShardArgs, []TransferShardDoneArgs) {
 	var shardArgs []TransferShardArgs
 	var shardDoneArgs []TransferShardDoneArgs
-	for shard := range kv.shardsDone {
+	for shard := range kv.transferTable {
 		// new shard from gid previous owned
-		if !kv.shardsDone[shard].DataDone {
+		if !kv.transferTable[shard].DataDone && kv.transferTable[shard].Type == transferStatusNew {
 			args := TransferShardArgs{
 				ConfigNum: kv.config.Num,
 				GID:       kv.prevConfig.Shards[shard],
@@ -392,7 +424,7 @@ func (kv *ShardKV) args4Rpc() ([]TransferShardArgs, []TransferShardDoneArgs) {
 			continue
 		}
 		// new shard applied, not yet confirm to gid previous owned
-		if !kv.shardsDone[shard].ReplyDone && kv.shardsDone[shard].Type == shardDoneTypeNew {
+		if !kv.transferTable[shard].ReplyDone && kv.transferTable[shard].DataDone && kv.transferTable[shard].Type == transferStatusNew {
 			args := TransferShardDoneArgs{
 				ConfigNum: kv.config.Num,
 				GID:       kv.prevConfig.Shards[shard],
@@ -404,10 +436,13 @@ func (kv *ShardKV) args4Rpc() ([]TransferShardArgs, []TransferShardDoneArgs) {
 	return shardArgs, shardDoneArgs
 }
 
-func (kv *ShardKV) sendRPCs(shardArgsList []TransferShardArgs, doneArgsList []TransferShardDoneArgs) {
+func (kv *ShardKV) sendRPCs(shardArgsList []TransferShardArgs, doneArgsList []TransferShardDoneArgs, prevConfig *shardctrler.Config) {
+	wg := sync.WaitGroup{}
 	for i := range shardArgsList {
+		wg.Add(1)
 		go func(args TransferShardArgs) {
-			reply := kv.sendTransferShard(&args)
+			defer wg.Done()
+			reply := kv.sendTransferShard(&args, prevConfig)
 			if !reply.Success {
 				return
 			}
@@ -417,8 +452,10 @@ func (kv *ShardKV) sendRPCs(shardArgsList []TransferShardArgs, doneArgsList []Tr
 		}(shardArgsList[i])
 	}
 	for i := range doneArgsList {
+		wg.Add(1)
 		go func(args TransferShardDoneArgs) {
-			reply := kv.sendTransferShardDone(&args)
+			defer wg.Done()
+			reply := kv.sendTransferShardDone(&args, prevConfig)
 			if !reply.Success {
 				return
 			}
@@ -426,16 +463,11 @@ func (kv *ShardKV) sendRPCs(shardArgsList []TransferShardArgs, doneArgsList []Tr
 			kv.rf.Start(op)
 		}(doneArgsList[i])
 	}
+	wg.Wait()
 }
 
-func (kv *ShardKV) sendTransferShard(args *TransferShardArgs) TransferShardReply {
-	kv.mu.RLock()
-	if kv.config.Num != args.ConfigNum {
-		kv.mu.RUnlock()
-		return TransferShardReply{Success: false}
-	}
-	sNames := kv.prevConfig.Groups[args.GID]
-	kv.mu.RUnlock()
+func (kv *ShardKV) sendTransferShard(args *TransferShardArgs, prevConfig *shardctrler.Config) TransferShardReply {
+	sNames := prevConfig.Groups[args.GID]
 	for i := range sNames {
 		clientEnd := kv.make_end(sNames[i])
 		var reply TransferShardReply
@@ -450,14 +482,8 @@ func (kv *ShardKV) sendTransferShard(args *TransferShardArgs) TransferShardReply
 	return TransferShardReply{Success: false}
 }
 
-func (kv *ShardKV) sendTransferShardDone(args *TransferShardDoneArgs) TransferShardDoneReply {
-	kv.mu.RLock()
-	if kv.config.Num != args.ConfigNum {
-		kv.mu.RUnlock()
-		return TransferShardDoneReply{Success: false}
-	}
-	sNames := kv.prevConfig.Groups[args.GID]
-	kv.mu.RUnlock()
+func (kv *ShardKV) sendTransferShardDone(args *TransferShardDoneArgs, prevConfig *shardctrler.Config) TransferShardDoneReply {
+	sNames := prevConfig.Groups[args.GID]
 	for i := range sNames {
 		clientEnd := kv.make_end(sNames[i])
 		var reply TransferShardDoneReply
@@ -473,49 +499,37 @@ func (kv *ShardKV) sendTransferShardDone(args *TransferShardDoneArgs) TransferSh
 }
 
 func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
-	shardsDone := map[int]shardDone{}
+	tb := map[int]transferStatus{}
 	if newConfig.Num == 1 {
 		for shard, gid := range newConfig.Shards {
 			if gid == kv.gid {
-				shardsDone[shard] = shardDone{DataDone: true, ReplyDone: true, Type: shardDoneTypeSame}
+				tb[shard] = transferStatus{DataDone: true, ReplyDone: true, Type: transferStatusSame}
 			}
 		}
 	} else {
 		for shard, gid := range kv.config.Shards {
 			if gid == kv.gid {
-				shardsDone[shard] = shardDone{DataDone: true, ReplyDone: false, Type: shardDoneTypeLose}
+				tb[shard] = transferStatus{DataDone: true, ReplyDone: false, Type: transferStatusLose}
 			}
 		}
 		for shard, gid := range newConfig.Shards {
 			if gid == kv.gid {
-				sd, shardDoneOk := shardsDone[shard]
-				if shardDoneOk {
-					sd.ReplyDone = true
-					sd.Type = shardDoneTypeSame
-					shardsDone[shard] = sd
+				status, statusOk := tb[shard]
+				if statusOk {
+					status.ReplyDone = true
+					status.Type = transferStatusSame
+					tb[shard] = status
 					continue
 				}
-				shardsDone[shard] = shardDone{DataDone: false, ReplyDone: false, Type: shardDoneTypeNew}
+				tb[shard] = transferStatus{DataDone: false, ReplyDone: false, Type: transferStatusNew}
 			}
 		}
 	}
 
 	kv.prevConfig = kv.config
 	kv.config = newConfig
-	kv.shardsDone = shardsDone
-	DPrintf("ShardKV me %d gid %d updated config %+v, shardsDone %+v", kv.me, kv.gid, kv.config, kv.shardsDone)
-}
-
-func (kv *ShardKV) checkConfigDone() bool {
-	if len(kv.shardsDone) == 0 {
-		return true
-	}
-	for shard := range kv.shardsDone {
-		if !kv.shardsDone[shard].DataDone || !kv.shardsDone[shard].ReplyDone {
-			return false
-		}
-	}
-	return true
+	kv.transferTable = tb
+	DPrintf("ShardKV me %d gid %d updated config %+v, transferTable %+v, previousConfig %+v", kv.me, kv.gid, kv.config, kv.transferTable, kv.prevConfig)
 }
 
 func (kv *ShardKV) applyUpdateConfig(op Op) {
@@ -523,7 +537,8 @@ func (kv *ShardKV) applyUpdateConfig(op Op) {
 		return
 	}
 
-	if kv.checkConfigDone() {
+	newDone, loseDone := kv.checkConfigDone()
+	if newDone && loseDone {
 		kv.updateConfig(*op.OpConfig.Config)
 	}
 }
@@ -549,20 +564,18 @@ func (kv *ShardKV) applyShardDone(index int, op Op) {
 	kv.replyInvalidTransferDoneRequests(index, rId)
 
 	request, requestOk := kv.transferDoneRequests[rId]
-	sd, sdOk := kv.shardsDone[shard]
+	status, statusOk := kv.transferTable[shard]
 	result := transferDoneResult{success: false}
-	if kv.config.Num == op.OpConfig.ConfigNum && sdOk && sd.DataDone && !sd.ReplyDone {
-		sd.ReplyDone = true
-		kv.shardsDone[shard] = sd
-	}
-	if kv.config.Num == op.OpConfig.ConfigNum && sdOk && sd.ReplyDone {
+	if kv.config.Num == op.OpConfig.ConfigNum && statusOk && status.DataDone && !status.ReplyDone {
+		status.ReplyDone = true
+		kv.transferTable[shard] = status
 		result.success = true
 		// if success, delete lose shard
-		if sd.Type == shardDoneTypeLose {
+		if status.Type == transferStatusLose {
 			delete(kv.shardStore, shard)
 		}
+		DPrintf("ShardKV me %d gid %d applied ShardDone, configNum %d, shard %d, status %+v", kv.me, kv.gid, kv.config.Num, shard, status)
 	}
-
 	if requestOk && request.replied == false {
 		request.replied = true
 		request.c <- result
@@ -575,24 +588,24 @@ func (kv *ShardKV) applyUpdateShardStore(op Op) {
 	if shard >= len(kv.config.Shards) || kv.config.Num != op.OpConfig.ConfigNum || kv.config.Shards[shard] != kv.gid {
 		return
 	}
-	sd, shardDoneOk := kv.shardsDone[shard]
-	if shardDoneOk && !sd.DataDone {
+	status, statusOk := kv.transferTable[shard]
+	if statusOk && !status.DataDone && !status.ReplyDone && status.Type == transferStatusNew {
 		// copy shard
 		// if me is in old config, me will reject client write to shard according to wrong group,
-		// if me is in the latest config same as client, me will reject client write to shard according to shardDone[shard].DataDone,
+		// if me is in the latest config same as client, me will reject client write to shard according to transferStatus[shard].DataDone,
 		// so it's safe to overwrite shard data
 		kv.shardStore[shard] = map[string]string{}
 		for k, v := range op.OpConfig.ShardStore {
 			kv.shardStore[shard][k] = v
 		}
-		sd.DataDone = true
-		kv.shardsDone[shard] = sd
 		// update client serial > than me, to prevent duplicate apply
 		for id, serial := range op.OpConfig.ClientSerial {
 			if serial > kv.clientSerial[id] {
 				kv.clientSerial[id] = serial
 			}
 		}
+		status.DataDone = true
+		kv.transferTable[shard] = status
 		DPrintf("ShardKV me %d gid %d applied UpdateShard, shard %d, config %d map %+v",
 			kv.me, kv.gid, shard, op.OpConfig.ConfigNum, op.OpConfig.ShardStore)
 	}
@@ -607,10 +620,10 @@ func (kv *ShardKV) replyInvalidRequests(index int, currentRid clientRequestId) {
 		}
 	}
 	for i := range invalidRids {
-		rInfo := kv.clientRequests[invalidRids[i]]
-		rInfo.replied = true
-		rInfo.c <- processResult{err: ErrWrongLeader}
-		kv.clientRequests[invalidRids[i]] = rInfo
+		request := kv.clientRequests[invalidRids[i]]
+		request.replied = true
+		request.c <- processResult{err: ErrWrongLeader}
+		kv.clientRequests[invalidRids[i]] = request
 	}
 }
 
@@ -620,9 +633,9 @@ func (kv *ShardKV) applyGetPutAppend(index int, op Op) {
 	request, requestOk := kv.clientRequests[rId]
 
 	processReply := processResult{err: OK}
-	rightGroup, sd := kv.validateKey(op.OpClient.Key)
-	if !rightGroup || !sd {
-		if requestOk {
+	rightGroup, shardDataDone := kv.validateKey(op.OpClient.Key)
+	if !rightGroup || !shardDataDone {
+		if requestOk && request.replied == false {
 			if !rightGroup {
 				processReply.err = ErrWrongGroup
 			} else {
@@ -652,8 +665,8 @@ func (kv *ShardKV) applyGetPutAppend(index int, op Op) {
 			value = value + op.OpClient.Value
 			kv.setShardStoreValue(op.OpClient.Key, value)
 		}
-		DPrintf("ShardKV gid %d, me %d startApply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %+v, reply.err %s",
-			kv.gid, kv.me, op.OpClient.ClientId, op.OpClient.Serial, kv.clientSerial[op.OpClient.ClientId], request.index, index, op, processReply.err)
+		DPrintf("ShardKV me %d gid %d startApply command: client %d, new serial %d, old serial %d, requestIndex %d, commandIndex %d, command %+v, reply.err %s",
+			kv.me, kv.gid, op.OpClient.ClientId, op.OpClient.Serial, kv.clientSerial[op.OpClient.ClientId], request.index, index, *op.OpClient, processReply.err)
 		kv.clientSerial[op.OpClient.ClientId] = op.OpClient.Serial
 	}
 
@@ -668,12 +681,14 @@ func (kv *ShardKV) startApply() {
 	for applyMsg := range kv.applyCh {
 		switch {
 		case applyMsg.CommandValid:
-			kv.mu.Lock()
 			kv.index = applyMsg.CommandIndex
 			op, ok := applyMsg.Command.(Op)
 			if !ok {
+				DPrintf("ShardKV me %d gid %d WARNING: command cannot convert to Op! This should never happen!!!", kv.me, kv.gid)
 				continue
 			}
+			DPrintf("ShardKV me %d gid %d receive command, op %d", kv.me, kv.gid, op.Op)
+			kv.mu.Lock()
 			switch op.Op {
 			case OpUpdateConfig:
 				kv.applyUpdateConfig(op)
@@ -697,23 +712,25 @@ func (kv *ShardKV) startApply() {
 			if applyMsg.SnapshotIndex >= kv.index {
 				if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
 					kv.switch2Snapshot(applyMsg.SnapshotIndex, applyMsg.Snapshot)
-					DPrintf("ShardKV gid %d, me %d startApply snapshot: switching snapshot, snapshotIndex %d, snapshotTerm %d, kv.index %d", kv.gid, kv.me, applyMsg.SnapshotIndex, applyMsg.SnapshotTerm, kv.index)
+					DPrintf("ShardKV me %d gid %d startApply snapshot: switching snapshot, snapshotIndex %d, snapshotTerm %d, kv.index %d",
+						kv.me, kv.gid, applyMsg.SnapshotIndex, applyMsg.SnapshotTerm, kv.index)
 				}
 			}
 			kv.mu.Unlock()
 		}
 	}
+	DPrintf("ShardKV me %d gid %d exit startApply()", kv.me, kv.gid)
 }
 
 func (kv *ShardKV) encodeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	snapshot := kvSnapshot{
-		ShardStore:   kv.shardStore,
-		ClientSerial: kv.clientSerial,
-		Config:       kv.config,
-		PrevConfig:   kv.prevConfig,
-		ShardsDone:   kv.shardsDone,
+		Config:        kv.config,
+		PrevConfig:    kv.prevConfig,
+		ClientSerial:  kv.clientSerial,
+		TransferTable: kv.transferTable,
+		ShardStore:    kv.shardStore,
 	}
 	e.Encode(snapshot)
 	return w.Bytes()
@@ -724,7 +741,7 @@ func (kv *ShardKV) decodeSnapshot(data []byte) kvSnapshot {
 	if len(data) == 0 {
 		snapshot.ShardStore = map[int]map[string]string{}
 		snapshot.ClientSerial = map[int]int64{}
-		snapshot.ShardsDone = map[int]shardDone{}
+		snapshot.TransferTable = map[int]transferStatus{}
 		return snapshot
 	}
 
@@ -742,7 +759,7 @@ func (kv *ShardKV) switch2Snapshot(lastIncludedIndex int, data []byte) {
 	kv.clientSerial = snapshot.ClientSerial
 	kv.config = snapshot.Config
 	kv.prevConfig = snapshot.PrevConfig
-	kv.shardsDone = snapshot.ShardsDone
+	kv.transferTable = snapshot.TransferTable
 	kv.index = lastIncludedIndex
 }
 
@@ -753,9 +770,11 @@ func (kv *ShardKV) switch2Snapshot(lastIncludedIndex int, data []byte) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
+	DPrintf("ShardKV me %d gid %d start Kill()", kv.me, kv.gid)
 	kv.rf.Kill()
 	// Your code here, if desired.
 	close(kv.killCh)
+	DPrintf("ShardKV me %d gid %d Kill() success", kv.me, kv.gid)
 }
 
 //
@@ -816,7 +835,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.startApply()
 	go kv.startPollConfig()
 
-	DPrintf("ShardKV me %d, gid %d join", kv.me, kv.gid)
+	DPrintf("ShardKV me %d gid %d join, snapshot index %d, rf.Log %+v, config %+v, transferTable %+v", kv.me, kv.gid, kv.index, kv.rf.Log, kv.config, kv.transferTable)
 
 	return kv
 }
