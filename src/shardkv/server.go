@@ -345,7 +345,7 @@ func (kv *ShardKV) queryConfig() {
 	if term > kv.term {
 		// if detected new term, add a blank no-op log entry to make sure raft can move forward
 		kv.term = term
-		kv.rf.Start(Op{Op: NoOp})
+		kv.rf.Start(nil)
 	}
 	kv.mu.RLock()
 	newDone, loseDone := kv.checkConfigDone()
@@ -684,7 +684,7 @@ func (kv *ShardKV) startApply() {
 			kv.index = applyMsg.CommandIndex
 			op, ok := applyMsg.Command.(Op)
 			if !ok {
-				DPrintf("ShardKV me %d gid %d WARNING: command cannot convert to Op! This should never happen!!!", kv.me, kv.gid)
+				DPrintf("ShardKV me %d gid %d, command nil, index %d", kv.me, kv.gid, kv.index)
 				continue
 			}
 			DPrintf("ShardKV me %d gid %d receive command, op %d", kv.me, kv.gid, op.Op)
@@ -719,7 +719,6 @@ func (kv *ShardKV) startApply() {
 			kv.mu.Unlock()
 		}
 	}
-	DPrintf("ShardKV me %d gid %d exit startApply()", kv.me, kv.gid)
 }
 
 func (kv *ShardKV) encodeSnapshot() []byte {
@@ -770,11 +769,9 @@ func (kv *ShardKV) switch2Snapshot(lastIncludedIndex int, data []byte) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
-	DPrintf("ShardKV me %d gid %d start Kill()", kv.me, kv.gid)
 	kv.rf.Kill()
 	// Your code here, if desired.
 	close(kv.killCh)
-	DPrintf("ShardKV me %d gid %d Kill() success", kv.me, kv.gid)
 }
 
 //
