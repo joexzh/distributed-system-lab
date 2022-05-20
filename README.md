@@ -1,4 +1,4 @@
-# 6.824 lab 1-4 -  my implementation
+# 6.824 lab: my rough implementation
 
 http://nil.csail.mit.edu/6.824/2021/index.html
 
@@ -17,7 +17,8 @@ Pass all test including lab 4 challenges.
 | shard | dataDone | replyDone | type |
 |-------|----------|-----------|------|
 | 1     | true     | false     | Lose |
-| 2     | false    | false     | new  |
+| 3     | false    | false     | new  |
+| 5     | true     | true      | same |
 
 When detect config change, re-generate the table
 
@@ -42,22 +43,21 @@ When detect config change, re-generate the table
 ### Configs are updated one by one, monotonically.
 
 When all records values are `dataDone=true` and `replyDone=true` in table, we can consider the current config is DONE.
-
-Consider one shard as DONE if it's `dataDone=true`, `replyDone=true` and `type=(new or same)`.
-
 Fetch new config number and update config only when current config is DONE.
 
-Only allow changes to a DONE shard.
+Consider one shard as DONE if it's `dataDone=true`, `replyDone=true` and `type=(new or same)`.
+Only DONE shard can accept key/value change.
 
-Wait forever for other group to reply for the shard I lose to set it's `replyDone=true`.
+Send request for new shard data, mark `dataDone=true`, 
+then send request to tell him that I have applied the shard, mark `replyDone=true`.
+If my shard `type=new`, his corresponding shard `type=lose`.
+
+Wait forever for other group to reply my lose shard, confirm that he has applied the shard, mark `replyDone=true`.
 
 If `type=lose` get marked `replyDone=true`, it's ok to delete the shard data, 
 because I (the group holds the table) can guarantee that other group has the shard data. (raft linearizabiliy).
 
-I send requests to update shards whose `type=new`,
-wait for others' requests to update shards whose `type=lose`.
-
-**We can totally ignore client config, client can always use the latest config.** 
+**We can always set client config to the latest.** 
 **if shard transformation is fast enough, client will see less `WrongGroup` err.**
       
 ### RPCs from one group to another, leader to leader at best try
