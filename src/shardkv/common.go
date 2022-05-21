@@ -28,7 +28,6 @@ const (
 	ErrDuplicateRequest    = "ErrDuplicateRequest"
 	ErrTransferShardUnDone = "ErrTransferShardUnDone"
 
-	NoOp               = 0
 	OpGet              = 1
 	OpPut              = 2
 	OpAppend           = 3

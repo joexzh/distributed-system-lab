@@ -290,9 +290,8 @@ type TransferShardDoneReply struct {
 
 func (kv *ShardKV) TransferShardDone(args *TransferShardDoneArgs, reply *TransferShardDoneReply) {
 	kv.mu.Lock()
-
 	reply.Success = false
-	if kv.gid != args.GID || args.ConfigNum < kv.config.Num || args.Shard >= len(kv.prevConfig.Shards) {
+	if kv.gid != args.GID || args.ConfigNum > kv.config.Num || args.Shard >= len(kv.prevConfig.Shards) {
 		kv.mu.Unlock()
 		return
 	}
